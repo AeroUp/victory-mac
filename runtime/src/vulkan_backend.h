@@ -1479,6 +1479,25 @@ public:
         return r;
     }
 
+    template<class Copy>
+    VkResult write_staged_title_batch(Copy&& copy) {
+        std::lock_guard layout_lock(tracker_mutex_);
+        std::lock_guard queue_lock(submit_mutex_);
+        if (image_work_pending_) {
+            const auto r = observe_result(vk.vkDeviceWaitIdle(device_), "vkDeviceWaitIdle (title staging batch)");
+            if (r != VK_SUCCESS) return r;
+            image_work_pending_ = false;
+        }
+        auto get_pieces = [&](ResourceId id, const VkImageSubresourceRange& range, LayoutPieces& pieces) {
+            return tracker_.pieces(id, range, pieces) && !pieces.empty();
+        };
+        auto mark_general = [&](ResourceId id, const LayoutPieces& pieces) {
+            for (const auto& p : pieces)
+                if (p.layout == VK_IMAGE_LAYOUT_UNDEFINED) tracker_.set(id, p.range, VK_IMAGE_LAYOUT_GENERAL);
+        };
+        return observe_result(copy(replay_, get_pieces, mark_general), "title staging batch upload");
+    }
+
     // Present and probe submissions have their own fences, outside the queue retirement timelines.
     void note_image_work_locked() { image_work_pending_ = true; }
 

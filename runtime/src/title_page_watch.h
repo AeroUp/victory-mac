@@ -96,9 +96,15 @@ using map = std::map<K, V, std::less<K>, Allocator<std::pair<const K, V>>>;
 namespace leonida::title_memory_map {
 
 inline std::atomic<std::uint64_t> map_generation{0};
+inline std::atomic<std::uint64_t> unmap_gen{0};
 
 inline std::uint64_t generation() { return map_generation.load(std::memory_order_acquire); }
+inline std::uint64_t unmap_generation() { return unmap_gen.load(std::memory_order_acquire); }
 inline void changed() { map_generation.fetch_add(1, std::memory_order_release); }
+inline void unmapped() {
+    unmap_gen.fetch_add(1, std::memory_order_release);
+    map_generation.fetch_add(1, std::memory_order_release);
+}
 
 }  // namespace leonida::title_memory_map
 

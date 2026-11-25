@@ -23,6 +23,62 @@ public:
         ready_ = VK_NULL_HANDLE;
     }
 
+    void begin_batch() {
+        batching_ = true;
+        batch_bytes_ = 0;
+        batch_items_.clear();
+        batch_regions_.clear();
+    }
+
+    template<class Device>
+    bool flush_batch(Device& d) {
+        if (batch_items_.empty()) return true;
+        const auto result = d.context->write_staged_title_batch(
+            [&](const leonida::ReplayFunctions& replay, auto&& get_pieces, auto&& mark_general) -> VkResult {
+                auto& vk = d.context->vk;
+                VkResult r = vk.vkResetCommandBuffer(command_, 0);
+                if (r != VK_SUCCESS) return r;
+                VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                if ((r = vk.vkBeginCommandBuffer(command_, &begin)) != VK_SUCCESS) return r;
+                std::vector<leonida::LayoutPieces> all_pieces(batch_items_.size());
+                for (std::size_t i = 0; i < batch_items_.size(); ++i) {
+                    const auto& item = batch_items_[i];
+                    if (!get_pieces(item.id, item.range, all_pieces[i])) continue;
+                    leonida::detail::image_barrier(replay, command_, item.image, item.range, VK_IMAGE_LAYOUT_UNDEFINED,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                    vk.vkCmdCopyBufferToImage(command_, buffer_, item.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                              static_cast<std::uint32_t>(item.region_count),
+                                              batch_regions_.data() + item.region_start);
+                    for (const auto& piece : all_pieces[i])
+                        leonida::detail::image_barrier(replay, command_, item.image, piece.range,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            piece.layout == VK_IMAGE_LAYOUT_UNDEFINED ? VK_IMAGE_LAYOUT_GENERAL : piece.layout,
+                            VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                }
+                if ((r = vk.vkEndCommandBuffer(command_)) != VK_SUCCESS) return r;
+                r = submit(d);
+                if (r == VK_SUCCESS) {
+                    for (std::size_t i = 0; i < batch_items_.size(); ++i)
+                        if (!all_pieces[i].empty()) mark_general(batch_items_[i].id, all_pieces[i]);
+                }
+                return r;
+            });
+        batch_items_.clear();
+        batch_regions_.clear();
+        batch_bytes_ = 0;
+        return result == VK_SUCCESS;
+    }
+
+    template<class Device>
+    bool end_batch(Device& d) {
+        const bool ok = flush_batch(d);
+        batching_ = false;
+        return ok;
+    }
+
     template<class Device>
     bool write(Device& d, leonida::ResourceId id, const leonida::ResourceBinding& image,
                const xg_xs::Texture& layout, const std::uint8_t* tiled, std::vector<std::uint64_t>& columns,
@@ -54,6 +110,35 @@ public:
                 bytes = copy.bufferOffset + slice * copy.imageExtent.depth;
                 regions_.push_back(copy);
             }
+        }
+        if (batching_) {
+            const VkDeviceSize item_align = std::max<VkDeviceSize>(16, 4u * block.bytes);
+            VkDeviceSize base_offset = batch_bytes_ + (item_align - batch_bytes_ % item_align) % item_align;
+            if (base_offset + bytes > capacity_) {
+                if (!batch_items_.empty()) {
+                    if (!flush_batch(d)) return false;
+                    base_offset = 0;
+                }
+                const VkDeviceSize target = std::max<VkDeviceSize>(bytes, VkDeviceSize(32) << 20);
+                if (!prepare(d, target)) return false;
+            }
+            const std::size_t region_start = batch_regions_.size();
+            for (auto copy : regions_) {
+                copy.bufferOffset += base_offset;
+                const auto level = copy.imageSubresource.mipLevel;
+                const auto& mip = layout.layout.plane[0].mips[level];
+                const auto row = mip.width_elements * block.bytes, slice = row * mip.height_elements;
+                auto* dst = mapped_ + copy.bufferOffset;
+                xg_xs::copy_elements<false>(layout, level, copy.imageSubresource.baseArrayLayer, tiled, dst, row, slice, columns);
+                if (inspect && !nonzero)
+                    nonzero = std::any_of(dst, dst + VkDeviceSize(slice) * copy.imageExtent.depth,
+                                          [](std::uint8_t c) { return c != 0; });
+                batch_regions_.push_back(copy);
+            }
+            batch_items_.push_back({id, image, {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, layers},
+                                    region_start, regions_.size()});
+            batch_bytes_ = base_offset + bytes;
+            return true;
         }
         if (!prepare(d, bytes)) return false;
         for (const auto& copy : regions_) {
@@ -195,6 +280,17 @@ private:
     VkSemaphore ready_{};
     std::uint64_t value_ = 0;
     std::vector<VkQueue> consumers_;
+    struct BatchItem {
+        leonida::ResourceId id;
+        leonida::ResourceBinding image;
+        VkImageSubresourceRange range;
+        std::size_t region_start;
+        std::size_t region_count;
+    };
+    bool batching_ = false;
+    VkDeviceSize batch_bytes_ = 0;
+    std::vector<BatchItem> batch_items_;
+    std::vector<VkBufferImageCopy> batch_regions_;
     std::vector<VkBufferImageCopy> regions_;
 };
 

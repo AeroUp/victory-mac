@@ -97,7 +97,7 @@ void free_title_block(void* p) {
     if(p)leonida::label::memory().release_heap(reinterpret_cast<std::uintptr_t>(p));
     if (p) leonida::title_va_aliases().remove_title_memory(reinterpret_cast<uintptr_t>(p));
     _aligned_free(p);
-    if (p) leonida::title_memory_map::changed();
+    if (p) leonida::title_memory_map::unmapped();
 }
 
 void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
@@ -441,7 +441,7 @@ bool isolate_placeholder(void* address, SIZE_T size) {
     }
     if (info.AllocationBase == address && info.RegionSize == size) return true;
     if (!VirtualFree(address, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) return false;
-    leonida::title_memory_map::changed();
+    leonida::title_memory_map::unmapped();
     return true;
 }
 
@@ -696,7 +696,7 @@ bool unmap_range(uintptr_t start, uintptr_t end) {
                                            MEM_PRESERVE_PLACEHOLDER)) {
             return false;
         }
-        leonida::title_memory_map::changed();
+        leonida::title_memory_map::unmapped();
         leonida::geometry_writes::notify(base, view_end, leonida::geometry_writes::Event::replaced);
         it = g_views.erase(it);
         // The pages of [start, end) this view held are unmapped now; the ones outside it are mapped again below.
@@ -916,14 +916,14 @@ BOOL WINAPI XMemFreePhysicalPages(uint64_t page_count, const uint64_t* page_arra
     for (uint64_t i = 0; i < page_count; ++i) {
         const auto it = g_pages.find(page_array[i]);
         if (it == g_pages.end()) {
-            if (i != 0) leonida::title_memory_map::changed();
+            if (i != 0) leonida::title_memory_map::unmapped();
             SetLastError(ERROR_INVALID_PARAMETER);
             return FALSE;
         }
         g_pages.erase(it);
         g_free_slots.push_back(page_array[i] / kFramesPerPage);
     }
-    if (page_count != 0) leonida::title_memory_map::changed();
+    if (page_count != 0) leonida::title_memory_map::unmapped();
     return TRUE;
 }
 
@@ -1185,7 +1185,7 @@ BOOL WINAPI TitleVirtualFree(LPVOID address, SIZE_T size, DWORD free_type) {
     const bool result=leonida::label::memory().release_pages(reinterpret_cast<std::uintptr_t>(address),size,(free_type&MEM_RELEASE)!=0,[&]{
         const BOOL r=::VirtualFree(address,size,free_type);saved=GetLastError();return !!r;
     });
-    if (result) leonida::title_memory_map::changed();
+    if (result) leonida::title_memory_map::unmapped();
     if (result && (free_type & MEM_DECOMMIT)) note_unwatched_change(address, size, 0, true);
     if (result && (free_type & MEM_RELEASE) && !(free_type & MEM_PRESERVE_PLACEHOLDER))
         leonida::title_write_watch::remove(reinterpret_cast<uintptr_t>(address));
@@ -1204,7 +1204,7 @@ BOOL WINAPI TitleVirtualFreeEx(HANDLE process,LPVOID address,SIZE_T size,DWORD f
 BOOL WINAPI TitleVirtualProtect(LPVOID address, SIZE_T size, DWORD protect, PDWORD old) {
     const BOOL result = VirtualProtect(address, size, protect, old);
     if (result) {
-        leonida::title_memory_map::changed();
+        leonida::title_memory_map::unmapped();
         const auto start = reinterpret_cast<uintptr_t>(address);
         leonida::geometry_writes::notify(start, start + size, leonida::geometry_writes::Event::replaced);
     }

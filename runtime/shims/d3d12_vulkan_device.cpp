@@ -9119,6 +9119,8 @@ struct TitleTexture {
     bool mapped = false;                    // a slot-133 texture the title mapped: checked before submissions
     bool stale = false;                     // changed bytes not uploaded yet (budget, or no host copy then)
     leonida::TextureReadability memory;     // protected by title_texture_mutex
+    std::uint64_t readable_gen = 0;         // title_memory_map::generation() of last confirmed-readable probe
+    bool readable_valid = false;
     std::vector<DXGI_FORMAT> formats;       // owned: the image's format and castable view formats
     std::uint64_t hash = 0;                 // hash_guarded (sampled) of the bytes the image was last filled from
     bool hashed = false;
@@ -10775,6 +10777,7 @@ public:
         const InTitleTextures inside;
         TitleTextureStats& stats = title_stats_;
         ++stats.passes;
+        state_.title_upload.begin_batch();
         std::uint64_t checked = 0, filled = 0;
         const auto visit = [&](TitleTexture& t) {
             // A slot-133 texture's guessed layout (no slot-70 view yet) is only used once the title maps it.
@@ -10847,6 +10850,12 @@ public:
                 return std::uint64_t(elapsed.count()) >= sweep_budget_us;
             });
         }
+        const auto flush_start = clock::now();
+        if (!state_.title_upload.end_batch(state_))
+            log_once("batched staged title texture upload failed", 1);
+        const auto flush_dt = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - flush_start).count();
+        stats.staged_ns += flush_dt;
+        stats.fill_staged_ns += flush_dt;
         stats.hashed += checked;
         stats.filled_bytes += filled;
         stats.max_pass_bytes = std::max(stats.max_pass_bytes, filled);
@@ -10877,7 +10886,8 @@ private:
         std::uint64_t staged_fills = 0, staged_ns = 0;
         // refresh_title_textures, since the last log line
         std::uint64_t passes = 0, checked = 0, hashed = 0, changed = 0, deferred = 0, filled_bytes = 0,
-                      max_pass_bytes = 0, hash_ns = 0, refresh_ns = 0;
+                      max_pass_bytes = 0, hash_ns = 0, refresh_ns = 0,
+                      read_ns = 0, copy_ns = 0, posthash_ns = 0, fill_staged_ns = 0;
         std::chrono::steady_clock::time_point last_log{};
     };
     TitleTextureStats title_stats_;                                 // under title_texture_mutex
@@ -11130,10 +11140,15 @@ private:
     static bool title_texture_readable(TitleTexture& t) {
         const bool guard = check_pages_before_read();
         if (!guard && !t.memory.pending()) return true;
+        const std::uint64_t ugen = leonida::title_memory_map::unmap_generation();
+        if (t.readable_valid && !t.memory.pending() && (t.mapped || t.readable_gen == ugen)) return true;
         const bool mapped = t.mapped && refresh_mapped_pages();
         const auto commit = mapped ? leonida::kernel_writes::state().committer.load(std::memory_order_acquire) : nullptr;
-        return t.memory.check(leonida::title_memory_map::generation(), guard && !mapped,
-                              [&] { return leonida::texture_memory_readable(t.cpu, t.layout.layout.size, commit); });
+        const bool ok = t.memory.check(leonida::title_memory_map::generation(), guard && !mapped,
+                                       [&] { return leonida::texture_memory_readable(t.cpu, t.layout.layout.size, commit); });
+        t.readable_valid = ok;
+        t.readable_gen = ugen;
+        return ok;
     }
 
     void refresh_title_texture(TitleTexture& t) {
@@ -11159,15 +11174,20 @@ private:
                     return 0;
                 }
         const std::uint64_t span = layout.layout.size;
+        const auto t0 = std::chrono::steady_clock::now();
         if (!title_texture_readable(t)) return 0;
+        const auto t1 = std::chrono::steady_clock::now();
+        title_stats_.read_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
         title_tiled_.resize(std::size_t(span));
         if (!copy_guarded(title_tiled_.data(), reinterpret_cast<const std::uint8_t*>(t.cpu), std::size_t(span),
-                          title_memory_write_combined(t.cpu))) {
+                          !state_.uma && title_memory_write_combined(t.cpu))) {
             // The section changed after VirtualQuery. Preserve the last complete upload and retry.
             t.memory.defer();
             t.stale = true;
             return 0;
         }
+        const auto t2 = std::chrono::steady_clock::now();
+        title_stats_.copy_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
         if (!t.owned && t.unbound_bytes) {
             if (!t.resource->image()) {
                 t.stale = true;
@@ -11182,9 +11202,12 @@ private:
             }
             t.set_resource(t.resource);
         }
+        const auto t3 = std::chrono::steady_clock::now();
         std::uint64_t hash = 0;
         hash_guarded(title_tiled_.data(), title_tiled_.size(), hash);
         t.full_hashed = t.every_byte() && hash_guarded(title_tiled_.data(), title_tiled_.size(), t.full_hash, true);
+        const auto t4 = std::chrono::steady_clock::now();
+        title_stats_.posthash_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t4 - t3).count();
         const bool volume = layout.layout.dimension == rt::xg_xs::kTexture3D;
         const bool trace_pool = leonida::dstorage::trace_enabled() && leonida::title_gpu_views::other_view(t.cpu);
         bool nonzero = false;
@@ -11192,8 +11215,10 @@ private:
         if (t.resource->staged_title()) {
             const auto start = std::chrono::steady_clock::now();
             ok = t.resource->upload_staged_title(layout, title_tiled_.data(), title_columns_, trace_pool, nonzero);
-            title_stats_.staged_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - start).count();
+            title_stats_.staged_ns += dt;
+            title_stats_.fill_staged_ns += dt;
             if (ok) ++title_stats_.staged_fills;
             if (!ok) log_once("staged title texture upload failed, format", int(t.resource->format()));
         } else {
@@ -11354,10 +11379,14 @@ private:
                          static_cast<unsigned long long>(s.deferred), double(s.filled_bytes) / 1048576.0,
                          double(s.filled_bytes) / 1048576.0 / double(s.passes), double(s.max_pass_bytes) / 1048576.0);
             const double ms_per_ns_per_pass = 1e-6 / double(s.passes);
-            std::fprintf(stderr, "[rt] title texture hash time %.3f ms/pass; refresh total %.3f ms/pass\n",
-                         double(s.hash_ns) * ms_per_ns_per_pass, double(s.refresh_ns) * ms_per_ns_per_pass);
+            std::fprintf(stderr,
+                         "[rt] title texture hash time %.3f ms/pass; refresh total %.3f ms/pass "
+                         "(read %.3f, copy %.3f, posthash %.3f, staged %.3f)\n",
+                         double(s.hash_ns) * ms_per_ns_per_pass, double(s.refresh_ns) * ms_per_ns_per_pass,
+                         double(s.read_ns) * ms_per_ns_per_pass, double(s.copy_ns) * ms_per_ns_per_pass,
+                         double(s.posthash_ns) * ms_per_ns_per_pass, double(s.fill_staged_ns) * ms_per_ns_per_pass);
             s.passes = s.checked = s.hashed = s.changed = s.deferred = s.filled_bytes = s.max_pass_bytes = 0;
-            s.hash_ns = s.refresh_ns = 0;
+            s.hash_ns = s.refresh_ns = s.read_ns = s.copy_ns = s.posthash_ns = s.fill_staged_ns = 0;
             s.written_ranges = 0;
         }
     }
