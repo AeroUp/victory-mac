@@ -605,9 +605,13 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
         r->ExceptionInformation[1] = fault.ExceptionInformation[1];
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    if (count(d.op).fetch_add(1, std::memory_order_relaxed) == 0)
+    const uint64_t hit = count(d.op).fetch_add(1, std::memory_order_relaxed);
+    if (hit == 0)
         std::fprintf(stderr, "[rt] cpu: this CPU has no %s; emulating it (first at %p)\n", name(d.op),
                      reinterpret_cast<void*>(c->Rip - d.length));
+    else if ((hit & 0x3FFFu) == 0)
+        std::fprintf(stderr, "[rt] cpu: %s emulated %llu times (latest at %p)\n", name(d.op),
+                     static_cast<unsigned long long>(hit), reinterpret_cast<void*>(c->Rip - d.length));
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 

@@ -22,6 +22,7 @@
 #include "base_reservation.h"
 #include "clzero_patch.h"
 #include "cpu_emulation.h"
+#include "zen2_hint_patch.h"
 
 namespace rt {
 
@@ -2206,8 +2207,12 @@ void Loader::protect_sections(Module& m) {
     // On a CPU without ADX (Rosetta 2, Haswell), ADCX and ADOX run from stubs that keep the flags exact, instead of
     // raising a #UD whose context Rosetta fills with stale flags (adx_rewrite.h, docs/macos.md). Same point: the
     // sections are writable and none of the image's code has run. LEONIDA_ADX_REWRITE=0 leaves them to the #UD path.
+    // On a CPU without MONITORX/MWAITX or CLWB, patch those hint instructions in place to NOP/PAUSE to avoid >1M #UD
+    // traps through the kernel/VEH (zen2_hint_patch.h; LEONIDA_HINT_PATCH=0 leaves them on the #UD path).
     static const bool adx_rewrite = rt::adx_rewrite::wanted();
-    if (adx_rewrite) {
+    static const auto host_caps = rt::cpu_emulation::detect_host();
+    static const bool hint_patch = rt::zen2_hint_patch::enabled() && (!host_caps.monitorx || !host_caps.clwb);
+    if (adx_rewrite || hint_patch) {
         std::vector<rt::adx_rewrite::Range> sections, functions;
         const IMAGE_SECTION_HEADER* cs = IMAGE_FIRST_SECTION(nt);
         for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++cs) {
@@ -2225,16 +2230,27 @@ void Loader::protect_sections(Module& m) {
             functions.reserve(static_cast<size_t>(count));
             for (uint64_t i = 0; i < count; ++i) functions.push_back({f[i].BeginAddress, f[i].EndAddress});
         }
-        const auto r = rt::adx_rewrite::rewrite(m.base, m.size, sections, functions);
-        if (r.error)
-            std::fprintf(stderr, "[rt] loader: %s: ADCX/ADOX not rewritten (%s); they stay on the #UD path\n",
-                         m.name.c_str(), r.error);
-        else if (r.rewritten || r.refused || r.unsynced)
-            std::fprintf(stderr,
-                         "[rt] loader: %s: %zu ADCX/ADOX run from stubs at %p (%zu inside .pdata functions); %zu left "
-                         "to the #UD path (%zu forms a stub does not take, %zu right after data)\n",
-                         m.name.c_str(), r.rewritten, static_cast<void*>(r.stubs), r.in_functions,
-                         r.refused + r.unsynced, r.refused, r.unsynced);
+        if (hint_patch) {
+            const auto hr = rt::zen2_hint_patch::patch(m.base, m.size, sections, functions, !host_caps.monitorx,
+                                                       !host_caps.clwb);
+            if (hr.monitorx || hr.mwaitx || hr.clwb)
+                std::fprintf(stderr,
+                             "[rt] loader: %s: patched %zu MONITORX, %zu MWAITX, %zu CLWB in place (%zu unsynced left "
+                             "to #UD)\n",
+                             m.name.c_str(), hr.monitorx, hr.mwaitx, hr.clwb, hr.unsynced);
+        }
+        if (adx_rewrite) {
+            const auto r = rt::adx_rewrite::rewrite(m.base, m.size, sections, functions);
+            if (r.error)
+                std::fprintf(stderr, "[rt] loader: %s: ADCX/ADOX not rewritten (%s); they stay on the #UD path\n",
+                             m.name.c_str(), r.error);
+            else if (r.rewritten || r.refused || r.unsynced)
+                std::fprintf(stderr,
+                             "[rt] loader: %s: %zu ADCX/ADOX run from stubs at %p (%zu inside .pdata functions); %zu left "
+                             "to the #UD path (%zu forms a stub does not take, %zu right after data)\n",
+                             m.name.c_str(), r.rewritten, static_cast<void*>(r.stubs), r.in_functions,
+                             r.refused + r.unsynced, r.refused, r.unsynced);
+        }
     }
     VirtualProtect(m.base, nt->OptionalHeader.SizeOfHeaders, PAGE_READONLY, &old);
     auto* sec = IMAGE_FIRST_SECTION(nt);
