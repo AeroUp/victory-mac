@@ -5240,21 +5240,25 @@ public:
                 shared_zero_ = device_.zero_sampled_image(desc_, format, footprint.size);
         }
         std::uint32_t plain_bits = 0;
-        if (stage_title && !shared_zero_ && allow_staged_title && origin != TitleImageOrigin::ordinary && !linear_placement &&
-            host_transfer_ && format.aspects == VK_IMAGE_ASPECT_COLOR_BIT && device_.image_requirements) {
-            for (std::uint32_t i = 0; i < device_.memory.memoryTypeCount; ++i) {
-                const auto flags = device_.memory.memoryTypes[i].propertyFlags;
-                if ((flags & (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) ==
-                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) plain_bits |= 1u << i;
-            }
-            VkMemoryRequirements with{}, without{};
-            auto staged = info;
-            staged.usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
-            if (plain_bits && device_.memory_requirements(info, with) && !(with.memoryTypeBits & plain_bits) &&
-                device_.memory_requirements(staged, without) && (without.memoryTypeBits & plain_bits)) {
+        if (stage_title && !shared_zero_ && allow_staged_title && origin != TitleImageOrigin::ordinary &&
+            format.aspects == VK_IMAGE_ASPECT_COLOR_BIT) {
+            if (!host_transfer_) {
                 staged_title_ = true;
-                host_transfer_ = false;
-                info.usage = staged.usage;
+            } else if (!linear_placement && device_.image_requirements) {
+                for (std::uint32_t i = 0; i < device_.memory.memoryTypeCount; ++i) {
+                    const auto flags = device_.memory.memoryTypes[i].propertyFlags;
+                    if ((flags & (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) ==
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) plain_bits |= 1u << i;
+                }
+                VkMemoryRequirements with{}, without{};
+                auto staged = info;
+                staged.usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
+                if (plain_bits && device_.memory_requirements(info, with) && !(with.memoryTypeBits & plain_bits) &&
+                    device_.memory_requirements(staged, without) && (without.memoryTypeBits & plain_bits)) {
+                    staged_title_ = true;
+                    host_transfer_ = false;
+                    info.usage = staged.usage;
+                }
             }
         }
         auto retry_host = [&] {
@@ -5285,7 +5289,7 @@ public:
         VkMemoryRequirements requirements{};
         std::uint32_t type = UINT32_MAX;
         const bool stream = origin == TitleImageOrigin::streamed || origin == TitleImageOrigin::pending_stream;
-        const auto allowed = staged_title_ ? plain_bits : UINT32_MAX;
+        const auto allowed = (staged_title_ && plain_bits) ? plain_bits : UINT32_MAX;
         const bool deferrable = desc_.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
                                                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
@@ -11830,14 +11834,26 @@ public:
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: kind = leonida::IndirectKind::draw; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: kind = leonida::IndirectKind::draw_indexed; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: kind = leonida::IndirectKind::dispatch; break;
-        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
-            // As DispatchMesh: only a device with mesh shaders (MeshShaderTier 1) takes it.
-            if (!state_.info.mesh_shader) return E_NOTIMPL;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH: {
+            // As DispatchMesh: only a device with mesh shaders (MeshShaderTier 1) takes it, unless
+            // LEONIDA_EXPERIMENT_MESH_SIGNATURE=1 opts in for ExecuteIndirect no-op testing.
+            static const bool allow_mesh_sig = [] {
+                const char* v = std::getenv("LEONIDA_EXPERIMENT_MESH_SIGNATURE");
+                return v && std::strcmp(v, "1") == 0;
+            }();
+            if (!state_.info.mesh_shader && !allow_mesh_sig) return E_NOTIMPL;
+            if (!state_.info.mesh_shader)
+                log_once("CreateCommandSignature(DISPATCH_MESH) allowed without VK_EXT_mesh_shader", 1);
             kind = leonida::IndirectKind::dispatch_mesh;
             break;
+        }
         default: return E_NOTIMPL;
         }
         return create_command_signature(kind, desc->ByteStride, riid, out, identity());
+    }
+
+    std::uint64_t take_submitted_draws() {
+        return state_.context ? state_.context->take_submitted_draws() : 0;
     }
 
     void STDMETHODCALLTYPE GetRaytracingAccelerationStructurePrebuildInfo(
@@ -16388,16 +16404,30 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
             }
         }
     }
+    bool is_moltenvk = false;
+    if (const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+            info.get_instance_proc ? info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2") : nullptr)) {
+        VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+        get_props2(info.physical, &props);
+        is_moltenvk = driver.driverID == VK_DRIVER_ID_MOLTENVK;
+    }
+    const char* host_copy_env = std::getenv("LEONIDA_HOST_IMAGE_COPY");
+    const bool allow_host_image_copy =
+        host_copy_env ? std::strcmp(host_copy_env, "0") != 0 : !is_moltenvk;
     VkPhysicalDeviceHostImageCopyFeaturesEXT host_copy{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT};
-    if (has_host_image_copy) {
+    if (has_host_image_copy && allow_host_image_copy) {
         VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &host_copy};
         vkGetPhysicalDeviceFeatures2(info.physical, &query);
     }
     const char* host_image_copy_name = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME;
-    info.host_image_copy = has_host_image_copy && host_copy.hostImageCopy;
+    info.host_image_copy = has_host_image_copy && allow_host_image_copy && host_copy.hostImageCopy;
     if (info.host_image_copy) {
         host_copy.pNext = *v13.next();  // after the conditional rendering features, if any
         *v13.next() = &host_copy;
+    } else if (has_host_image_copy && !allow_host_image_copy) {
+        std::fprintf(stderr, "[rt] d3d12: VK_EXT_host_image_copy disabled%s; CPU texture copies use a staging submit\n",
+                     is_moltenvk && !host_copy_env ? " (MoltenVK)" : "");
     } else {
         std::fprintf(stderr, "[rt] d3d12: no VK_EXT_host_image_copy; CPU texture copies use a staging submit\n");
     }
@@ -16790,6 +16820,13 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
 
 std::filesystem::path configured_shader_directory(std::string* error, const std::filesystem::path& config) {
     return leonida::shader_paths::configured(error, config);
+}
+
+std::uint64_t take_submitted_draws(ID3D12Device* device) {
+    if (!device) return 0;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    auto* d = Device::from<Device>(real ? real : device);
+    return d ? d->take_submitted_draws() : 0;
 }
 
 }  // namespace rt::d3d12

@@ -1807,6 +1807,7 @@ public:
     // Cross-queue Wait-before-Signal: per fence, the highest value a Signal was submitted for, and the queues that
     // hold batches until one is (queue_holds.h).
     QueueHolds<VkSemaphore>& holds() { return holds_; }
+    std::uint64_t take_submitted_draws() { return submitted_draws_.exchange(0, std::memory_order_relaxed); }
 
 private:
     friend class VulkanQueue;
@@ -2048,6 +2049,7 @@ private:
     ReplayFunctions replay_;
     std::unique_ptr<PredicateReducer> predicate_reducer_;
     std::unique_ptr<PredicatedBufferCopier> predicated_copier_;
+    std::atomic<std::uint64_t> submitted_draws_{0};
     std::unique_ptr<IndirectDispatchCounter> counted_dispatch_;
     std::unique_ptr<QuadIndexExpander> quad_indices_;
     std::uint32_t predicate_family_ = UINT32_MAX;
@@ -2812,6 +2814,8 @@ private:
             segments += prepared[i].segment_count;
             statistics_segments += prepared[i].statistics_segment_count;
             has_queries = has_queries || !prepared[i].queries.empty();
+            if (prepared[i].draw_count)
+                context_.submitted_draws_.fetch_add(prepared[i].draw_count, std::memory_order_relaxed);
         }
         const auto segment_pool = [this](VkQueryType type, std::uint32_t count,
                                          std::shared_ptr<OcclusionSegmentPool>& out) {
