@@ -663,6 +663,35 @@ int main(int argc, char** argv) {
             }
         }
 
+        // A pipeline the device cannot build (not async: a stage its driver rejects, as MoltenVK does a vertex shader
+        // that reads its subgroup lane) drops only its own draw; the list still succeeds and runs the rest. Without
+        // LEONIDA_STRICT_REPLAY, which strict_replay() reads once per process, so this test runs without it.
+        if (!strict_replay()) {
+            auto vk = scene.vk;
+            auto original = scene.bare;
+            scene.bare.pipeline = {};
+            scene.bare.async_build = false;
+            scene.bare.variant = [](std::uint32_t) { return VkPipeline{VK_NULL_HANDLE}; };
+            ComputePipeline available{};
+            available.pipeline = original.pipeline;
+            vk.compute_pipeline = [&](std::uintptr_t) { return &available; };
+            static unsigned direct, draws;
+            vk.dispatch = [](VkCommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t) { ++direct; };
+            vk.draw = [](VkCommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t) { ++draws; };
+            CommandList list;
+            const bool recorded = list.dispatch({2, {}, 1, 1, 1}) && list.draw(plain) &&
+                list.dispatch({2, {}, 1, 1, 1}) && list.close();
+            direct = draws = 0;
+            const bool pass = recorded && replay(list, VK_NULL_HANDLE, resolve, vk) == ReplayResult::success &&
+                direct == 2 && draws == 0;
+            scene.bare = std::move(original);
+            if (!pass) {
+                std::fprintf(stderr, "FAIL unbuildable pipeline: its draw was not dropped alone (direct %u, draws %u)\n",
+                             direct, draws);
+                ++failures;
+            }
+        }
+
         // The counts don't depend on timing: a second run must make exactly the same allocations and calls.
         const Result again = run(scene, lists, frame, reps, warmup);
         if (again.emit.vk_calls != f.emit.vk_calls || again.prepare.allocations != f.prepare.allocations) {

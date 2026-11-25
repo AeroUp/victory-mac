@@ -18,8 +18,8 @@ Refused instead of guessed (Unsupported, naming the pattern): a source that is n
 written, or a pristine copy in the wrong role, is the #1224 guard's refusal (interp_pair_src, at
 emission); here: a computed pair whose p1 partial is rewritten or read between the ops (its hardware value P10*I is then
 observable), one whose ops are not in a single basic block (the captured I would not dominate the p2), a
-dangling op without its partner, and any computed pair under --bary-fallback, which has no PerVertexKHR
-inputs. A pristine pair (v0/v1 nothing writes) keeps the interpolated-input read: no PerVertexKHR.
+dangling op without its partner. Without PerVertexKHR inputs (--bary-fallback, --f16-interp-fallback) the vertex
+values are rebuilt from screen-space derivatives instead (ComputedIJWithoutPerVertexInputs). A pristine pair (v0/v1 nothing writes) keeps the interpolated-input read: no PerVertexKHR.
 
 Pipodi's straight-line scan over the corpus found the affected 213 PS (upper bound; issue #1218,
 comment 7076614458); the classification and counts are in docs/design.md's SHADER-177 row.
@@ -29,6 +29,7 @@ import unittest
 
 import support
 import rdna2spirv
+import spirv_mini_interp
 
 # Barycentric weights of vertices 0, 1, 2 as Vulkan hands them over ((k, i, j); AMD's i, j are .y/.z).
 BARY = (0.25, 0.25, 0.5)
@@ -286,29 +287,126 @@ class ComputedIJRefusals(unittest.TestCase):
                  "s_endpgm"]
         self.refuse(lines, "the pair's ops are not in one basic block")
 
-    def test_computed_pair_under_bary_fallback(self):
-        old = rdna2spirv.BARY_FALLBACK
-        rdna2spirv.BARY_FALLBACK = True
-        try:
-            self.refuse(["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0",
-                         "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
-                         "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"],
-                        "computed I/J pair under --bary-fallback")
-        finally:
-            rdna2spirv.BARY_FALLBACK = old
 
-    def test_computed_pair_under_f16_interp_fallback(self):
-        # --f16-interp-fallback reads decoded halves from the producer: no per-vertex inputs to
-        # weight with a computed pair (same regime as --bary-fallback)
-        old = rdna2spirv.F16_HALVES
-        rdna2spirv.F16_HALVES = True
-        try:
-            self.refuse(["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0",
-                         "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
-                         "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"],
-                        "computed I/J pair under --f16-interp-fallback")
-        finally:
-            rdna2spirv.F16_HALVES = old
+# One 2x2 quad, lanes as Vulkan lays them out (bit 0 the x step, bit 1 the y step). The weights are not affine in x
+# and y (lane 3 is not lane 1 + lane 2 - lane 0), as perspective-correct barycentrics are not, and are dyadic, so
+# the rebuilt vertex values are exact.
+QUAD = ((0.5, 0.25, 0.25), (0.375, 0.5, 0.125), (0.25, 0.25, 0.5), (0.25, 0.5, 0.25))
+FALLBACKS = ("BARY_FALLBACK", "F16_HALVES")
+
+
+def translate_under(flag, name, asm):
+    old = getattr(rdna2spirv, flag)
+    setattr(rdna2spirv, flag, True)
+    try:
+        return support.translate_lines(name, asm)
+    finally:
+        setattr(rdna2spirv, flag, old)
+
+
+def run_quad(spv, inputs_for, derivatives):
+    _, outs = spirv_mini_interp.run_workgroup(spv, 4, 4, inputs_for=inputs_for, return_outputs=True,
+                                              derivatives=derivatives)
+    return [floats(o["%out_mrt0"]) for o in outs]
+
+
+class ComputedIJWithoutPerVertexInputs(unittest.TestCase):
+    """Both fallbacks (--bary-fallback, --f16-interp-fallback) have no PerVertexKHR inputs. A computed pair rebuilds P0,
+    P1 - P0 and P2 - P0 from the interpolated input and %bary with screen-space derivatives in the prologue
+    (rdna2spirv Gen.attribute_rebuilt), so each site gives what the per-vertex path gives, on every lane of a quad,
+    with fine and with coarse derivatives. Until 2026-11-25 these were refused: 207 corpus PS (all of SHADER-177's
+    computed set), so a MoltenVK build, where the f16 fallback is on by default, could not finish its shaders stage."""
+
+    def quad(self, asm, expect, attrs=None):
+        for flag in FALLBACKS:
+            spv = translate_under(flag, "ps_ij_rebuilt", asm)
+            self.assertNotIn("PerVertexKHR", spv)
+            self.assertIn("OpDPdx", spv)
+            inputs_for = lambda i: support.varyings(spv, attrs or {0: ATTR0}, QUAD[i])   # noqa: E731
+            for derivatives in ("fine", "coarse"):
+                with self.subTest(fallback=flag, derivatives=derivatives):
+                    got = run_quad(spv, inputs_for, derivatives)
+                    for lane, words in enumerate(got):
+                        self.assertEqual(words[:len(expect(lane))], expect(lane), f"lane {lane}")
+
+    def test_constant_pair_snaps_to_a_point(self):
+        self.quad(["v_mov_b32_e32 v0, 0.25", "v_mov_b32_e32 v1, 0.25",
+                   "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                   "v_interp_p1_f32_e32 v3, v0, attr0.y", "v_interp_p2_f32_e32 v3, v1, attr0.y",
+                   "v_interp_p1_f32_e32 v4, v0, attr0.z", "v_interp_p2_f32_e32 v4, v1, attr0.z",
+                   "exp mrt0 v2, v3, v4, v2 done vm", "s_endpgm"],
+                  lambda lane: (0.5, 0.5, 2.5))
+
+    def test_zeroed_pair_reads_the_provoking_vertex(self):
+        self.quad(["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0",
+                   "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                   "v_interp_p1_f32_e32 v3, v0, attr0.z", "v_interp_p2_f32_e32 v3, v1, attr0.z",
+                   "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"],
+                  lambda lane: (0.0, 1.0))
+
+    def test_arithmetic_pair_evaluates_at_an_offset(self):
+        """(I, J/2) from each lane's own pair: u stays 2I, v halves to J."""
+        self.quad(["v_mov_b32_e32 v10, v0", "v_mul_f32_e32 v11, 0.5, v1",
+                   "v_mov_b32_e32 v0, v10", "v_mov_b32_e32 v1, v11",
+                   "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                   "v_interp_p1_f32_e32 v3, v0, attr0.y", "v_interp_p2_f32_e32 v3, v1, attr0.y",
+                   "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"],
+                  lambda lane: (2 * QUAD[lane][1], QUAD[lane][2]))
+
+    def test_j_written_between_the_ops(self):
+        self.quad(["v_mov_b32_e32 v16, 1.0", "v_mov_b32_e32 v0, v15",
+                   "v_interp_p1_f32_e32 v2, v0, attr0.x",
+                   "v_mul_f32_e32 v1, 0.25, v16",
+                   "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                   "v_interp_p1_f32_e32 v3, v0, attr0.y",
+                   "v_mul_f32_e32 v1, 0.5, v16",
+                   "v_interp_p2_f32_e32 v3, v1, attr0.y",
+                   "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"],
+                  lambda lane: (0.0, 1.0))
+
+    def test_f16_pair_through_decoded_halves(self):
+        """--f16-interp-fallback: the f16 forms rebuild from the decoded halves the producer exports."""
+        LO, HI = (0.5, 1.5, 2.5), (-4.0, 8.0, 16.0)
+        spv = translate_under("F16_HALVES", "ps_ij_rebuilt_f16", [
+            "v_mov_b32_e32 v0, 0.5", "v_mov_b32_e32 v1, 0",
+            "v_interp_p1ll_f16 v2, v0, attr0.x", "v_interp_p2_f16 v2, v1, attr0.x, v2",
+            "v_interp_p1ll_f16 v3, v0, attr0.x high", "v_interp_p2_f16 v3, v1, attr0.x, v3 high",
+            "exp mrt0 v2, v3, v2, v3 done vm", "s_endpgm"])
+        self.assertNotIn("PerVertexKHR", spv)
+        lerp = lambda b, vs: sum(w * v for w, v in zip(b, vs))   # noqa: E731
+        inputs_for = lambda i: {"%bary": QUAD[i], "%in_f16h0_0": (lerp(QUAD[i], LO), 0.0, 0.0, 0.0),   # noqa: E731
+                                "%in_f16h0_1": (lerp(QUAD[i], HI), 0.0, 0.0, 0.0)}
+        for derivatives in ("fine", "coarse"):
+            with self.subTest(derivatives=derivatives):
+                _, outs = spirv_mini_interp.run_workgroup(spv, 4, 4, inputs_for=inputs_for, return_outputs=True,
+                                                          derivatives=derivatives)
+                for lane, o in enumerate(outs):
+                    w = o["%out_mrt0"]
+                    # (k, i, j) = (0.5, 0.5, 0): low 0.5*0.5 + 0.5*1.5 = 1.0; high 0.5*-4 + 0.5*8 = 2.0
+                    self.assertEqual((f"{w[0] & 0xFFFF:#06x}", f"{w[1] & 0xFFFF:#06x}"), ("0x3c00", "0x4000"),
+                                     f"lane {lane}")
+
+    def test_singular_quad_reads_the_interpolated_input(self):
+        """A quad whose invocations share one pair (an edge-on triangle) gives no deltas: the site reads A, finite."""
+        flat_quad = (QUAD[0],) * 4
+        spv = translate_under("F16_HALVES", "ps_ij_singular", [
+            "v_mov_b32_e32 v0, 0.25", "v_mov_b32_e32 v1, 0.25",
+            "v_interp_p1_f32_e32 v2, v0, attr0.z", "v_interp_p2_f32_e32 v2, v1, attr0.z",
+            "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"])
+        inputs_for = lambda i: support.varyings(spv, {0: ATTR0}, flat_quad[i])   # noqa: E731
+        a = sum(b * v[2] for b, v in zip(flat_quad[0], UV))
+        for words in run_quad(spv, inputs_for, "fine"):
+            self.assertEqual(words[0], a)
+
+    def test_without_a_computed_pair_nothing_changes(self):
+        """A pristine pair keeps the plain interpolated read: no derivative prologue."""
+        for flag in FALLBACKS:
+            with self.subTest(fallback=flag):
+                spv = translate_under(flag, "ps_ij_pristine", [
+                    "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                    "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"])
+                self.assertNotIn("OpDPdx", spv)
+                self.assertNotIn("%ijp0_", spv)
 
 
 if __name__ == "__main__":

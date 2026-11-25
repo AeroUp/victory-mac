@@ -107,9 +107,29 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
 find_program(LEONIDA_ML64 NAMES ml64 llvm-ml64)
 
 # ctest runs the PE tests through Wine, or Proton's wine (-DCMAKE_CROSSCOMPILING_EMULATOR=<Proton>/files/bin/wine).
+# On a Mac, WineHQ's builds are app bundles that put nothing on PATH (docs/macos.md), so their bin folders are searched
+# after PATH, and Wine runs with ROSETTA_ADVERTISE_AVX=1: Rosetta 2 runs AVX code but leaves AVX out of CPUID without
+# it, and gta6rt --run then stops at its host CPU check (src/host_cpu.h).
 if(NOT CMAKE_CROSSCOMPILING_EMULATOR)
-  find_program(XWIN_WINE NAMES wine wine64)
-  if(XWIN_WINE)
+  set(_xwin_wine_hints)
+  if(CMAKE_HOST_APPLE)
+    foreach(_root "$ENV{HOME}/Applications" "/Applications")
+      foreach(_app "Wine Stable" "Wine Staging" "Wine Devel")
+        list(APPEND _xwin_wine_hints "${_root}/${_app}.app/Contents/Resources/wine/bin")
+      endforeach()
+    endforeach()
+  endif()
+  find_program(XWIN_WINE NAMES wine wine64 PATHS ${_xwin_wine_hints})
+  if(XWIN_WINE AND CMAKE_HOST_APPLE AND CMAKE_BINARY_DIR)
+    # One program, not a list: tests hand the emulator on as a single -DRUNNER= argument.
+    set(_xwin_wine_wrapper "${CMAKE_BINARY_DIR}/wine-rosetta.sh")
+    file(WRITE "${_xwin_wine_wrapper}"
+         "#!/bin/sh\n# Written by clang-cl-xwin.cmake: Wine with AVX in Rosetta's CPUID (docs/macos.md).\n"
+         "ROSETTA_ADVERTISE_AVX=\"\${ROSETTA_ADVERTISE_AVX:-1}\" exec \"${XWIN_WINE}\" \"$@\"\n")
+    file(CHMOD "${_xwin_wine_wrapper}" PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE
+         WORLD_READ WORLD_EXECUTE)
+    set(CMAKE_CROSSCOMPILING_EMULATOR "${_xwin_wine_wrapper}")
+  elseif(XWIN_WINE)
     set(CMAKE_CROSSCOMPILING_EMULATOR "${XWIN_WINE}")
   elseif(CMAKE_BINARY_DIR)
     message(STATUS "Wine not found: ctest can't run the Windows tests (set CMAKE_CROSSCOMPILING_EMULATOR)")

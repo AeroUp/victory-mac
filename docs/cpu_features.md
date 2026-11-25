@@ -45,12 +45,18 @@ Each flagged site was read by hand in a private copy (not quoted here):
 
 No AVX-512, VAES, VPCLMULQDQ, SHA, RDPID, RDPRU, XOP, FMA4, TBM, SYSCALL or SYSENTER instruction was found. The
 256-bit integer, FMA3, F16C, BMI1/2, ADX, MOVBE, AES-NI and PCLMULQDQ instructions it uses are on every Intel CPU
-since Haswell/Broadwell and every AMD CPU since Zen, so they are counted but not flagged. No RDTSC or RDTSCP is
+since Haswell/Broadwell and every AMD CPU since Zen, so they are counted but not flagged. ADX is the exception off
+desktop hardware: Haswell and Rosetta 2 (an Apple Silicon Mac running the loader under Wine) raise `#UD` on every
+ADCX/ADOX form, while Rosetta runs the rest of that list ([macos.md](macos.md#rosetta-2-and-the-games-instructions)). No RDTSC or RDTSCP is
 in the image.
 
 ## What it means for the runtime
 
 - On an AMD Zen 2 or later host every flagged user-mode instruction runs as on the console.
+- Without ADX (Haswell, Rosetta 2) the 2,678 ADCX/ADOX sites (none inside a `.pdata` range) would raise `#UD`. The
+  loader rewrites them before the image runs into stubs that use `ADC` and keep the other flags (`adx_rewrite.h`);
+  `cpu_emulation.h` still emulates one it did not rewrite, on the thread's context, whose flags Rosetta can hand over
+  wrong ([macos.md](macos.md#adx-sites-are-rewritten-before-the-game-runs)).
 - On an Intel host the SSE4a, CLZERO and MONITORX sites, and on Intel client CPUs before Ice Lake the CLWB sites,
   raise `STATUS_ILLEGAL_INSTRUCTION` when reached. `gta6rt` emulates them (`runtime/src/cpu_emulation.h`, see
   [runtime/README.md](../runtime/README.md), "PE loader"): CLZERO zeroes the 64-byte line, CLWB is a write-back hint

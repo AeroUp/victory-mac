@@ -286,6 +286,63 @@ class RuntimePackagingTest(unittest.TestCase):
         result = subprocess.check_output([os.path.join(moved, "gta6rt.sh"), "--dry-run"], cwd=self.root, env=env)
         self.assertEqual(json.loads(result)[2], "Z:" + real(moved) + "/Shader cache '$HOME'/shaders/spirv")
 
+    def mac_launcher(self, *, bundle=True, path_wine=False):
+        """The generated gta6rt.sh with `uname -s` answering Darwin and HOME holding a WineHQ app bundle whose wine
+        (a stand-in that runs the artifact with this Python) reports its argv and ROSETTA_ADVERTISE_AVX."""
+        home = os.path.join(self.root, "home")
+        tools = os.path.join(self.root, "tools")
+        os.makedirs(tools)
+        with open(os.path.join(tools, "uname"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("#!/bin/sh\necho Darwin\n")
+        os.chmod(os.path.join(tools, "uname"), 0o755)
+        wine = f"#!/bin/sh\nexec {shlex.quote(sys.executable)} \"$@\"\n"
+        if bundle:
+            bindir = os.path.join(home, "Applications", "Wine Stable.app", "Contents", "Resources", "wine", "bin")
+            os.makedirs(bindir)
+            with open(os.path.join(bindir, "wine"), "w", encoding="utf-8", newline="\n") as f:
+                f.write(wine.replace("exec", "WINE_FROM=bundle exec"))
+            os.chmod(os.path.join(bindir, "wine"), 0o755)
+        if path_wine:
+            with open(os.path.join(tools, "wine"), "w", encoding="utf-8", newline="\n") as f:
+                f.write(wine.replace("exec", "WINE_FROM=path exec"))
+            os.chmod(os.path.join(tools, "wine"), 0o755)
+        self.write_artifact("gta6rt_tls_host.dll", b"")
+        self.write_artifact("gta6rt.exe", b"import os, sys, json\n"
+                            b"print(json.dumps([sys.argv[1:], os.getenv('ROSETTA_ADVERTISE_AVX'), "
+                            b"os.getenv('WINE_FROM')]))\n")
+        make_game.runtime(self.game, self.out, {"expected_exe": "game.exe"}, self.build)
+        # Only the stand-ins and the tools the script itself runs (readlink, dirname, cat) are on PATH.
+        system = os.pathsep.join(d for d in ("/usr/bin", "/bin") if os.path.isdir(d))
+        env = {"PATH": tools + os.pathsep + system, "HOME": home}
+        return os.path.join(self.out, "gta6rt.sh"), env
+
+    @unittest.skipIf(os.name == "nt", "executes the generated POSIX launcher")
+    def test_on_a_mac_wine_is_found_in_the_winehq_app_bundle_with_avx_advertised(self):
+        launcher, env = self.mac_launcher()
+        result = subprocess.run([launcher, "--version"], cwd=self.root, env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [["--version"], "1", "bundle"])
+        env["ROSETTA_ADVERTISE_AVX"] = "0"   # a value the user set is kept
+        result = subprocess.run([launcher, "--version"], cwd=self.root, env=env, capture_output=True, text=True)
+        self.assertEqual(json.loads(result.stdout)[1], "0")
+
+    @unittest.skipIf(os.name == "nt", "executes the generated POSIX launcher")
+    def test_on_a_mac_wine_on_path_and_wine_set_come_first(self):
+        launcher, env = self.mac_launcher(path_wine=True)
+        result = subprocess.run([launcher, "--version"], cwd=self.root, env=env, capture_output=True, text=True)
+        self.assertEqual(json.loads(result.stdout)[2], "path")
+        env["WINE"] = sys.executable
+        result = subprocess.run([launcher, "--version"], cwd=self.root, env=env, capture_output=True, text=True)
+        self.assertEqual(json.loads(result.stdout), [["--version"], "1", None])
+
+    @unittest.skipIf(os.name == "nt", "executes the generated POSIX launcher")
+    def test_without_any_wine_the_launcher_says_what_to_install(self):
+        launcher, env = self.mac_launcher(bundle=False)
+        result = subprocess.run([launcher, "--version"], cwd=self.root, env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 127)
+        self.assertIn("No Wine found", result.stderr)
+        self.assertIn("docs/macos.md", result.stderr)
+
     def test_runtime_records_shader_work_directory(self):
         self.write_artifact("gta6rt_tls_host.dll", b"TLS host")
         work = os.path.join(self.root, "Shader Work \u03bb")
@@ -406,7 +463,7 @@ class CrossBuildTest(unittest.TestCase):
         toolchain = os.path.join(self.root, "runtime", "cmake", "clang-cl-xwin.cmake")
         self.assertEqual(configure, ["cmake", "-S", os.path.join(self.root, "runtime"), "-B", self.build,
                                      "-G", "Ninja", "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
-                                     "--toolchain", toolchain, "-DXWIN_DIR=/sdk"])
+                                     "--toolchain", toolchain, "-DXWIN_DIR=/sdk", "-DLEONIDA_SDL3_FETCH=ON"])
         self.assertEqual(build, ["cmake", "--build", self.build, "--parallel", "4",
                                  "--target", "gta6rt", "gta6rt_tls_host"])
         for name in make_game.RUNTIME_FILES:

@@ -191,7 +191,7 @@ class MainWiringTest(unittest.TestCase):
     """main() parses the fallback flags and hands the same tuple to preflight() and shaders()."""
 
     def run_main(self, *extra_argv, per_vertex=None, barycentric_fallback=None, max_push_constants=None,
-                 mesh_crash=False):
+                 mesh_crash=False, vertex_lane=None):
         # An empty --out: main() reads the flags an existing translation was made with, and the default folder
         # is the user's own.
         out = tempfile.TemporaryDirectory()
@@ -203,6 +203,7 @@ class MainWiringTest(unittest.TestCase):
                 mock.patch("make_game.check", return_value={"expected_exe": "game.exe"}), \
                 mock.patch("make_game.wave64_settings", return_value=(False, True)), \
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
+                mock.patch("make_game.runtime_gpu_vertex_lane_index", return_value=vertex_lane), \
                 mock.patch("make_game.runtime_gpu_barycentric_fallback", return_value=barycentric_fallback), \
                 mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
                 mock.patch("make_game.runtime_gpu_mesh_draws_crash", return_value=mesh_crash), \
@@ -228,6 +229,23 @@ class MainWiringTest(unittest.TestCase):
         self.assertEqual(self.run_main(per_vertex=False), (("--f16-interp-fallback",),) * 2)
         self.assertEqual(self.run_main(per_vertex=True), ((), ()))
         self.assertEqual(self.run_main("--f16-interp-fallback", per_vertex=True), (("--f16-interp-fallback",),) * 2)
+
+    def test_vs_single_lane_follows_the_device(self):
+        """On by itself where vk_subgroup_info says a vertex shader can't read its subgroup lane (MoltenVK), not where
+        it can or can't tell; asked for explicitly, it is on everywhere. Both MoltenVK fallbacks together keep
+        FALLBACK_FLAGS order."""
+        self.assertEqual(self.run_main(vertex_lane=False), (("--vs-single-lane",),) * 2)
+        self.assertEqual(self.run_main(vertex_lane=True), ((), ()))
+        self.assertEqual(self.run_main(vertex_lane=None), ((), ()))
+        self.assertEqual(self.run_main("--vs-single-lane", vertex_lane=True), (("--vs-single-lane",),) * 2)
+        self.assertEqual(self.run_main(per_vertex=False, vertex_lane=False),
+                         (("--f16-interp-fallback", "--vs-single-lane"),) * 2)
+
+    def test_runtime_gpu_vertex_lane_index_requires_a_boolean_probe_result(self):
+        for raw, want in (({"vertex_lane_index": True}, True), ({"vertex_lane_index": False}, False),
+                          ({}, None), ({"vertex_lane_index": "false"}, None)):
+            with self.subTest(raw=raw), mock.patch("make_game.runtime_gpu_info", return_value=raw):
+                self.assertIs(make_game.runtime_gpu_vertex_lane_index(), want)
 
     def test_barycentric_fallback_follows_anv_probe(self):
         self.assertEqual(self.run_main(barycentric_fallback=True), (("--bary-fallback",),) * 2)
@@ -342,6 +360,7 @@ class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
                 mock.patch("make_game.check", return_value={"expected_exe": "game.exe"}), \
                 mock.patch("make_game.wave64_settings", return_value=(False, True)), \
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
+                mock.patch("make_game.runtime_gpu_vertex_lane_index", return_value=None), \
                 mock.patch("make_game.runtime_gpu_barycentric_fallback", return_value=None), \
                 mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
                 mock.patch("make_game.runtime_gpu_mesh_draws_crash", return_value=mesh_crash), \

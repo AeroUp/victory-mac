@@ -1,12 +1,13 @@
 """runtime/test/shaders/build.py under the PerVertexKHR fallbacks (LEONIDA_BARY_FALLBACK=1, LEONIDA_F16_INTERP_FALLBACK=1).
 
-The translator refuses a computed I/J pair (ps_ij_computed) without PerVertexKHR inputs, which both fallbacks take
-away. build.py used to treat that as a failed batch: it exited before publishing anything, so check.py then reported
-every test missing (0 of 147 on a Mac, where check.py needs LEONIDA_F16_INTERP_FALLBACK=1). check.py and
-run_gpu_tests.py report ps_ij_computed as SKIP there; build.py now leaves it out and builds the rest.
+Both fallbacks take PerVertexKHR inputs away. The translator used to refuse a computed I/J pair (ps_ij_computed)
+there, and build.py left it out (before that, the refusal failed the whole batch: 0 of 147 on a Mac, where check.py
+needs LEONIDA_F16_INTERP_FALLBACK=1). Since 2026-11-25 the translator rebuilds the pair's vertex values from
+screen-space derivatives instead, so build.py asks for every shader under a fallback too, and a missing module is a
+failed batch again.
 
-Standard library only; the translator is replaced by a stand-in that writes the index and modules and, like the real
-one, refuses ps_ij_computed under a fallback. No llvm-mc, SPIR-V tools, GPU or game data.
+Standard library only; the translator is replaced by a stand-in that writes the index and modules. No llvm-mc, SPIR-V
+tools, GPU or game data.
 
     python -I tests/test_shader_build_fallbacks.py
 """
@@ -50,13 +51,10 @@ class BuildUnderFallbackTest(unittest.TestCase):
     def fake_translate(self, work, names):
         """What rdna2spirv.py leaves in <work>/spirv: a module and an index entry per shader it validated."""
         self.asked.append(list(names))
-        fallback = any(os.environ.get(v) == "1" for v in FALLBACKS)
         spirv = Path(work) / "spirv"
         spirv.mkdir(parents=True)
         index = {}
         for n in names:
-            if n == "ps_ij_computed" and fallback:
-                continue   # "computed I/J pair under --f16-interp-fallback: no PerVertexKHR inputs"
             (spirv / (n + ".spv")).write_bytes(b"\x03\x02\x23\x07")
             (spirv / (n + ".spvasm")).write_text("; SPIR-V\n", encoding="utf-8")
             index[n] = {"stage": n[:2]}
@@ -79,17 +77,16 @@ class BuildUnderFallbackTest(unittest.TestCase):
                 status = e.code
         return status, stdout.getvalue()
 
-    def test_each_fallback_builds_the_rest_without_ps_ij_computed(self):
+    def test_each_fallback_builds_ps_ij_computed_too(self):
         for var in FALLBACKS:
             with self.subTest(fallback=var):
                 self.fresh()
                 status, printed = self.run_build(["cs_store", "ps_ij_computed"], {var: "1"})
                 self.assertEqual(status, 0, printed)
-                self.assertEqual(self.asked, [["cs_store"]])
+                self.assertEqual(self.asked, [["cs_store", "ps_ij_computed"]])
                 self.assertTrue((self.out / "spirv" / "cs_store.spv").is_file())
-                self.assertFalse((self.out / "spirv" / "ps_ij_computed.spv").exists())
-                self.assertIn("ps_ij_computed", printed)
-                self.assertIn("PerVertexKHR", printed)
+                self.assertTrue((self.out / "spirv" / "ps_ij_computed.spv").is_file())
+                self.assertNotIn("not built", printed)
 
     def test_missing_mullit_fixture_is_not_accepted_as_a_build_target(self):
         status, printed = self.run_build(["ps_mullit"], {})
@@ -100,7 +97,7 @@ class BuildUnderFallbackTest(unittest.TestCase):
         # Before: "Translation did not produce validated SPIR-V for: ps_ij_computed", and an empty <out>/spirv.
         status, printed = self.run_build([], {"LEONIDA_F16_INTERP_FALLBACK": "1"})
         self.assertEqual(status, 0, printed)
-        self.assertNotIn("ps_ij_computed", self.asked[0])
+        self.assertIn("ps_ij_computed", self.asked[0])
         published = {p.stem for p in (self.out / "spirv").glob("*.spv")}
         self.assertEqual(published, set(self.asked[0]))
         self.assertIn("ps_interp_f16_high", published)   # the f16 halves still translate under this fallback

@@ -32,6 +32,11 @@ docs/design.md): the fragmentShaderBarycentric feature, and a driver other than 
 conversion rejects the decoration ("PerVertexKHR decoration is not supported in MSL", MoltenVK 1.4.2). Where it is
 false, the shaders are translated with --f16-interp-fallback.
 
+vertex_lane_index says whether a vertex shader can read its subgroup lane (SubgroupLocalInvocationId): false on
+MoltenVK, whose SPIR-V to MSL conversion stops with "Subgroup builtins are not available in this type of function"
+(Metal vertex functions have no SIMD-lane index; MoltenVK 1.4.2). Where it is false, the shaders are translated with
+--vs-single-lane.
+
 barycentric_fallback is true for Intel's open-source Mesa driver (ANV). SHADER-925 found that Mesa ANV 26.2.5
 advertises fragmentShaderBarycentric but returns a zero BaryCoordKHR.i for translated pixel shaders on Intel Arc B580;
 the pass-through geometry-shader fallback is correct there. The builder therefore selects --bary-fallback for ANV
@@ -365,6 +370,10 @@ def query(*, stage_caps=False) -> dict:
             "native64_compute": compute64,
             "native64": compute64 and mesh64,
             "per_vertex_inputs": per_vertex,
+            # Metal vertex functions have no SIMD-lane index, so MoltenVK cannot convert a VS that reads
+            # SubgroupLocalInvocationId: make_game.py then translates with --vs-single-lane. Vulkan has no feature bit
+            # for it, so this keys on the driver as per_vertex_inputs does.
+            "vertex_lane_index": driver != VK_DRIVER_ID_MOLTENVK,
             "barycentric_fallback": barycentric_fallback(vendor, device, driver),
             "max_push_constants_size": max_push_constants_size,
             "vendor_id": vendor,

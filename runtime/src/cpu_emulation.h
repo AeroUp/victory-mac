@@ -1,7 +1,8 @@
 // Emulates the few Zen 2 instructions in the game's code that a desktop CPU may lack (docs/cpu_features.md).
 //
 // The executable is built for the console's AMD Zen 2 and uses some of its instructions without asking CPUID:
-// SSE4a INSERTQ/EXTRQ, CLZERO and MONITORX/MWAITX (AMD only) and CLWB (Intel since Ice Lake). On a host without
+// SSE4a INSERTQ/EXTRQ, CLZERO and MONITORX/MWAITX (AMD only), CLWB (Intel since Ice Lake) and ADX ADCX/ADOX (every
+// CPU since Broadwell and Zen, but not Rosetta 2 on a Mac, nor Haswell). On a host without
 // one, the CPU raises #UD (STATUS_ILLEGAL_INSTRUCTION) at that instruction. A vectored handler recognises these
 // encodings at the faulting RIP, does the same work on the thread's CONTEXT and continues after the instruction.
 // On a host that has the feature the CPU runs the instruction itself and the handler never sees it.
@@ -23,6 +24,15 @@
 // The APM leaves xmm1[127:64] undefined after INSERTQ and EXTRQ; a Zen 3 zeroes it in all four forms (measured in
 // #7111's review), so the emulation does too. A field with len + idx > 64 is undefined as well; the emulation keeps
 // the bits that fit, which matched that Zen 3 on every len/idx pair.
+//
+// ADX is on every desktop CPU since Broadwell and Zen, but not in Rosetta 2, which runs the x86-64 Windows build
+// (under Wine) on an Apple Silicon Mac: there every ADCX and ADOX form raises #UD, while AVX, AVX2, FMA3, F16C,
+// BMI1/2, MOVBE, AES-NI and PCLMULQDQ run (measured on an M3 Pro, macOS 27.2.1, docs/macos.md). Intel SDM vol. 2:
+//   ADCX r32/64, r/m32/64          66 [REX.W] 0F 38 F6 /r   dst = dst + src + CF; writes CF only
+//   ADOX r32/64, r/m32/64          F3 [REX.W] 0F 38 F6 /r   dst = dst + src + OF; writes OF only
+// Without REX.W the operation is 32 bits wide and, like every 32-bit register write, zeroes bits 63:32 of dst. The
+// other flags keep their values. A memory source read through an FS or GS override is left alone (stays #UD): the
+// segment base is the host's, not something this handler can read portably.
 #pragma once
 
 #include <cstddef>
@@ -31,24 +41,137 @@
 
 namespace rt::cpu_emulation {
 
-enum class Op { none, insertq_imm, insertq_reg, extrq_imm, extrq_reg, clzero, monitorx, mwaitx, clwb };
+enum class Op { none, insertq_imm, insertq_reg, extrq_imm, extrq_reg, clzero, monitorx, mwaitx, clwb, adcx, adox,
+                count };
+
+// A ModRM memory operand: base + index * scale + disp, or disp from the next instruction's RIP.
+struct Mem {
+    int base = -1;   // general register 0-15 (RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8-R15), -1 for none
+    int index = -1;  // the same, -1 for none
+    unsigned scale = 1;
+    int64_t disp = 0;
+    bool rip = false;  // RIP-relative: disp counts from the end of the instruction
+};
 
 struct Decoded {
     Op op = Op::none;
     std::size_t length = 0;  // bytes, prefixes included
-    int dst = 0;             // xmm register (INSERTQ, EXTRQ)
-    int src = 0;             // xmm register (the register forms)
+    int dst = 0;             // xmm register (INSERTQ, EXTRQ), general register (ADCX, ADOX)
+    int src = 0;             // xmm register (the register forms), general register (ADCX, ADOX from a register)
     uint8_t len = 0;         // field length and index of the immediate forms
     uint8_t idx = 0;
-    bool addr32 = false;     // a 67 prefix: CLZERO uses EAX
+    bool addr32 = false;     // a 67 prefix: CLZERO uses EAX, a memory operand 32-bit addresses
+    bool wide = false;       // REX.W: ADCX and ADOX on 64 bits
+    bool memory = false;     // ADCX, ADOX: the source is `mem`
+    uint8_t segment = 0;     // ADCX, ADOX: a 64 (FS) or 65 (GS) override on the memory source, with segment_memory
+    Mem mem;
 };
 
-// One of the encodings above at `code` (`avail` readable bytes), or Op::none.
-inline Decoded decode(const uint8_t* code, std::size_t avail) {
+// The addressing bytes after a ModRM byte whose mod is not 3, from code[i]: SIB, then the displacement. Returns the
+// index after them, or 0 when they run past `avail`. REX.X and REX.B extend the index and base registers; they do not
+// change which forms mean "no base" (mod 0 with base 5) or "no index" (index 4 without REX.X), as in the SDM.
+inline std::size_t decode_mem(const uint8_t* code, std::size_t avail, std::size_t i, uint8_t modrm, uint8_t rex,
+                              Mem* m) {
+    const int mod = modrm >> 6, rm = modrm & 7;
+    *m = Mem{};
+    if (rm == 4) {  // SIB
+        if (i >= avail) return 0;
+        const uint8_t sib = code[i++];
+        const int index = ((sib >> 3) & 7) | ((rex & 2) << 2), base = sib & 7;
+        m->scale = 1u << (sib >> 6);
+        if (index != 4) m->index = index;
+        if (mod == 0 && base == 5) {
+            if (i + 4 > avail) return 0;
+            int32_t d32;
+            std::memcpy(&d32, code + i, 4);
+            m->disp = d32;
+            return i + 4;
+        }
+        m->base = base | ((rex & 1) << 3);
+    } else if (mod == 0 && rm == 5) {
+        if (i + 4 > avail) return 0;
+        int32_t d32;
+        std::memcpy(&d32, code + i, 4);
+        m->disp = d32;
+        m->rip = true;
+        return i + 4;
+    } else {
+        m->base = rm | ((rex & 1) << 3);
+    }
+    if (mod == 1) {
+        if (i + 1 > avail) return 0;
+        m->disp = int8_t(code[i]);
+        return i + 1;
+    }
+    if (mod == 2) {
+        if (i + 4 > avail) return 0;
+        int32_t d32;
+        std::memcpy(&d32, code + i, 4);
+        m->disp = d32;
+        return i + 4;
+    }
+    return i;
+}
+
+// The address a decoded memory operand names. `gpr` holds the general registers in encoding order; `next_rip` is the
+// address after the instruction. With a 67 prefix the address is computed on 32 bits.
+inline uint64_t effective_address(const Mem& m, const uint64_t (&gpr)[16], uint64_t next_rip, bool addr32) {
+    uint64_t a = m.rip ? next_rip : 0;
+    if (m.base >= 0) a += gpr[m.base];
+    if (m.index >= 0) a += gpr[m.index] * m.scale;
+    a += uint64_t(m.disp);
+    return addr32 ? (a & 0xFFFFFFFFu) : a;
+}
+
+// ADCX and ADOX: dst + src + carry on 64 bits (wide) or 32 bits, zero-extended; *carry_out is the carry out of the
+// top bit, the new CF (ADCX) or OF (ADOX).
+inline uint64_t add_with_carry(uint64_t dst, uint64_t src, bool carry_in, bool wide, bool* carry_out) {
+    if (wide) {
+        const uint64_t s = dst + src, r = s + uint64_t(carry_in);
+        *carry_out = s < dst || r < s;
+        return r;
+    }
+    const uint64_t r = uint64_t(uint32_t(dst)) + uint32_t(src) + uint64_t(carry_in);
+    *carry_out = (r >> 32) != 0;
+    return uint32_t(r);
+}
+
+constexpr uint64_t kFlagCf = 1u << 0;   // RFLAGS.CF, ADCX's carry
+constexpr uint64_t kFlagOf = 1u << 11;  // RFLAGS.OF, ADOX's carry
+
+// ADCX or ADOX on a register file in encoding order: reads the source (through `read(address, bytes, &value)`, which
+// returns false when it cannot read there), writes dst and the one flag, and steps `rip` past the instruction. False,
+// with nothing changed and the address in *fault_address, when the source cannot be read.
+template <class Read>
+inline bool apply_adx(const Decoded& d, uint64_t (&gpr)[16], uint64_t& rip, uint64_t& rflags, Read&& read,
+                      uint64_t* fault_address = nullptr) {
+    if (d.op != Op::adcx && d.op != Op::adox) return false;
+    uint64_t src = 0;
+    if (d.memory) {
+        const uint64_t address = effective_address(d.mem, gpr, rip + d.length, d.addr32);
+        if (!read(address, std::size_t(d.wide ? 8 : 4), &src)) {
+            if (fault_address) *fault_address = address;
+            return false;
+        }
+    } else {
+        src = gpr[d.src];
+    }
+    const uint64_t flag = d.op == Op::adcx ? kFlagCf : kFlagOf;
+    bool carry = false;
+    gpr[d.dst] = add_with_carry(gpr[d.dst], src, (rflags & flag) != 0, d.wide, &carry);
+    rflags = carry ? (rflags | flag) : (rflags & ~flag);
+    rip += d.length;
+    return true;
+}
+
+// One of the encodings above at `code` (`avail` readable bytes), or Op::none. An ADCX/ADOX memory source with an FS or GS
+// override is Op::none unless `segment_memory` (src/adx_rewrite.h copies the override into its stub; the handler here
+// cannot read through it).
+inline Decoded decode(const uint8_t* code, std::size_t avail, bool segment_memory = false) {
     Decoded d;
     std::size_t i = 0;
     bool p66 = false, pf2 = false, pf3 = false;
-    uint8_t rex = 0;
+    uint8_t rex = 0, segment = 0;
     // Legacy prefixes and REX bytes in any order; only a REX right before the opcode counts, an earlier one is
     // ignored (as AMD CPUs do: `48 66 0F 01 FC` and `48 48 0F 01 FC` are CLZERO). LOCK (F0) ends the scan: #UD.
     for (; i < avail && i < 14; ++i) {
@@ -58,7 +181,8 @@ inline Decoded decode(const uint8_t* code, std::size_t avail) {
         else if (b == 0xF2) pf2 = true;
         else if (b == 0xF3) pf3 = true;
         else if (b == 0x67) d.addr32 = true;
-        else if (b == 0x2E || b == 0x3E || b == 0x26 || b == 0x36 || b == 0x64 || b == 0x65) {}
+        else if (b == 0x64 || b == 0x65) segment = b;  // the last segment override counts
+        else if (b == 0x2E || b == 0x3E || b == 0x26 || b == 0x36) {}  // ignored in 64-bit mode
         else break;
         rex = 0;
     }
@@ -74,6 +198,26 @@ inline Decoded decode(const uint8_t* code, std::size_t avail) {
         d.op = m == 0xFC ? Op::clzero : m == 0xFA ? Op::monitorx : m == 0xFB ? Op::mwaitx : Op::none;
         d.length = i;
         return d.op == Op::none ? Decoded{} : d;
+    }
+    if (op == 0x38) {  // ADCX (66), ADOX (F3): 0F 38 F6 /r
+        if (i + 2 > avail || code[i] != 0xF6) return {};
+        const uint8_t modrm = code[i + 1];
+        i += 2;
+        // Other prefix mixes select other instructions (0F 38 F6 alone is WRSS) or nothing a compiler emits.
+        if (pf2 || p66 == pf3) return {};
+        d.op = p66 ? Op::adcx : Op::adox;
+        d.wide = (rex & 8) != 0;
+        d.dst = ((modrm >> 3) & 7) | ((rex & 4) << 1);
+        if ((modrm >> 6) == 3) {
+            d.src = (modrm & 7) | ((rex & 1) << 3);
+        } else {
+            d.memory = true;
+            i = decode_mem(code, avail, i, modrm, rex, &d.mem);
+            if (!i || (segment && !segment_memory)) return {};
+            d.segment = segment;
+        }
+        d.length = i;
+        return d;
     }
     if (i >= avail) return {};
     const uint8_t modrm = code[i++];
@@ -95,15 +239,9 @@ inline Decoded decode(const uint8_t* code, std::size_t avail) {
         return d;
     }
     if (op == 0xAE && p66 && !pf2 && !pf3 && mod != 3 && ((modrm >> 3) & 7) == 6) {  // CLWB m8
-        if ((modrm & 7) == 4) {  // SIB
-            if (i >= avail) return {};
-            const uint8_t sib = code[i++];
-            if (mod == 0 && (sib & 7) == 5) i += 4;
-        } else if (mod == 0 && (modrm & 7) == 5) {
-            i += 4;  // RIP-relative
-        }
-        i += mod == 1 ? 1 : mod == 2 ? 4 : 0;
-        if (i > avail) return {};
+        Mem unused;
+        i = decode_mem(code, avail, i, modrm, rex, &unused);  // only its length: the hint needs no address
+        if (!i) return {};
         d.op = Op::clwb;
         d.length = i;
         return d;
@@ -140,7 +278,7 @@ inline uint64_t extract_bits(uint64_t src, unsigned len, unsigned idx) {
 namespace rt::cpu_emulation {
 
 struct Host {
-    bool sse4a = false, monitorx = false, clzero = false, clwb = false;
+    bool sse4a = false, monitorx = false, clzero = false, clwb = false, adx = false;
 };
 
 inline Host detect_host() {
@@ -151,6 +289,7 @@ inline Host detect_host() {
     if (max_leaf >= 7) {
         __cpuidex(r, 7, 0);
         h.clwb = (r[1] >> 24) & 1;  // EBX bit 24
+        h.adx = (r[1] >> 19) & 1;   // EBX bit 19
     }
     __cpuid(r, 0x80000000);
     const unsigned max_ext = unsigned(r[0]);
@@ -174,13 +313,15 @@ inline const char* name(Op op) {
     case Op::monitorx: return "MONITORX";
     case Op::mwaitx: return "MWAITX";
     case Op::clwb: return "CLWB";
+    case Op::adcx: return "ADCX (ADX)";
+    case Op::adox: return "ADOX (ADX)";
     default: return "none";
     }
 }
 
 // How many times each instruction was emulated; the two forms of INSERTQ and of EXTRQ share one count.
 inline std::atomic<uint64_t>& count(Op op) {
-    static std::atomic<uint64_t> counts[9];
+    static std::atomic<uint64_t> counts[int(Op::count)];
     if (op == Op::insertq_reg) op = Op::insertq_imm;
     if (op == Op::extrq_reg) op = Op::extrq_imm;
     return counts[int(op)];
@@ -217,14 +358,89 @@ inline std::size_t readable(uint64_t addr, std::size_t want) {
     return got;
 }
 
+// 0 when all `size` bytes at `addr` can be read; otherwise the exception the read raises at the first byte that
+// cannot. A guard page loses its guard on that first touch, as in writable().
+inline DWORD read_fault(uint64_t addr, std::size_t size, uint64_t* where) {
+    for (uint64_t page = addr & ~uint64_t(0xFFF); page < addr + size; page += 0x1000) {
+        const uint64_t at = page < addr ? addr : page;
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(reinterpret_cast<void*>(at), &mbi, sizeof mbi) || mbi.State != MEM_COMMIT ||
+            !mbi.Protect || (mbi.Protect & PAGE_NOACCESS)) {
+            *where = at;
+            return DWORD(STATUS_ACCESS_VIOLATION);
+        }
+        if (mbi.Protect & PAGE_GUARD) {
+            DWORD old = 0;
+            VirtualProtect(reinterpret_cast<void*>(page), 1, mbi.Protect & ~DWORD(PAGE_GUARD), &old);
+            *where = at;
+            return DWORD(STATUS_GUARD_PAGE_VIOLATION);
+        }
+    }
+    return 0;
+}
+
+// CONTEXT's general registers in encoding order.
+inline DWORD64& gpr(CONTEXT* c, int r) {
+    switch (r & 15) {
+    case 0: return c->Rax;
+    case 1: return c->Rcx;
+    case 2: return c->Rdx;
+    case 3: return c->Rbx;
+    case 4: return c->Rsp;
+    case 5: return c->Rbp;
+    case 6: return c->Rsi;
+    case 7: return c->Rdi;
+    case 8: return c->R8;
+    case 9: return c->R9;
+    case 10: return c->R10;
+    case 11: return c->R11;
+    case 12: return c->R12;
+    case 13: return c->R13;
+    case 14: return c->R14;
+    default: return c->R15;
+    }
+}
+
 inline uint64_t& lo(CONTEXT* c, int r) { return c->FltSave.XmmRegisters[r].Low; }
 inline uint64_t hi(const CONTEXT* c, int r) { return uint64_t(c->FltSave.XmmRegisters[r].High); }
 
-// Apply one decoded instruction to `c` and step past it. False when the line CLZERO zeroes cannot be written; then
-// `fault`, when given, receives the exception the write raised (STATUS_ACCESS_VIOLATION with the write flag and the
-// line's address, or STATUS_GUARD_PAGE_VIOLATION, as the real instruction would raise) and `c` is unchanged.
+// Apply one decoded instruction to `c` and step past it. False when the line CLZERO zeroes cannot be written or the
+// memory ADCX/ADOX reads cannot be read; then `fault`, when given, receives the exception the access raised
+// (STATUS_ACCESS_VIOLATION with the write or read flag and the address, or STATUS_GUARD_PAGE_VIOLATION, as the real
+// instruction would raise) and `c` is unchanged.
 inline bool apply(const Decoded& d, CONTEXT* c, EXCEPTION_RECORD* fault = nullptr) {
     switch (d.op) {
+    case Op::adcx: case Op::adox: {
+        uint64_t regs[16];
+        for (int r = 0; r < 16; ++r) regs[r] = gpr(c, r);
+        uint64_t rip = c->Rip, rflags = c->EFlags, fault_address = 0;
+        DWORD code = 0;
+        const auto read = [&](uint64_t address, std::size_t size, uint64_t* value) {
+            uint64_t where = address;
+            code = read_fault(address, size, &where);
+            if (code) {
+                fault_address = where;
+                return false;
+            }
+            *value = 0;
+            std::memcpy(value, reinterpret_cast<const void*>(address), size);
+            return true;
+        };
+        if (!apply_adx(d, regs, rip, rflags, read)) {
+            if (fault && code) {
+                std::memset(fault, 0, sizeof *fault);
+                fault->ExceptionCode = code;
+                fault->NumberParameters = 2;
+                fault->ExceptionInformation[0] = 0;  // a read
+                fault->ExceptionInformation[1] = ULONG_PTR(fault_address);
+            }
+            return false;
+        }
+        gpr(c, d.dst) = regs[d.dst];
+        c->EFlags = DWORD(rflags);
+        c->Rip = rip;
+        return true;
+    }
     case Op::insertq_imm:
         lo(c, d.dst) = insert_bits(lo(c, d.dst), lo(c, d.src), d.len, d.idx);
         c->FltSave.XmmRegisters[d.dst].High = 0;
@@ -379,8 +595,8 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
         }
     }
     if (!apply(d, c, &fault)) {
-        // CLZERO on a line it cannot write: the CPU would raise that fault at this instruction, so the next handlers
-        // see it instead of the #UD (RIP still points at the instruction).
+        // CLZERO on a line it cannot write, or ADCX/ADOX from memory it cannot read: the CPU would raise that fault at
+        // this instruction, so the next handlers see it instead of the #UD (RIP still points at the instruction).
         EXCEPTION_RECORD* r = info->ExceptionRecord;
         r->ExceptionCode = fault.ExceptionCode;
         r->ExceptionFlags = 0;

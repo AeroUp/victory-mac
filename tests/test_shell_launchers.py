@@ -17,6 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCHERS = {"Build.sh": ["make_game.py"], "Mods.sh": ["tools/leonida_mods.py", "gui"]}
+VERSIONED = [f"python3.{minor}" for minor in range(19, 11, -1)]
 
 STUB = """#!/bin/sh
 if [ "$1" = -c ]; then
@@ -62,7 +63,7 @@ class ShellLauncherTest(unittest.TestCase):
     def test_the_first_new_enough_python_runs_the_tool_with_every_argument(self):
         for launcher, tool in LAUNCHERS.items():
             with self.subTest(launcher=launcher):
-                for name in ("python3.14", "python3.13", "python3.12", "python3", "python"):
+                for name in (*VERSIONED, "python3", "python"):
                     (self.bin / name).unlink(missing_ok=True)
                 self.stub("python3.13", ok=False)          # too old: skipped
                 self.stub("python3.12")
@@ -73,6 +74,25 @@ class ShellLauncherTest(unittest.TestCase):
                 want = ["-I", str(ROOT / tool[0]), *tool[1:], *args]
                 self.assertEqual(self.recorded("python3.12"), want)
                 self.assertFalse((self.tmp / "log.python3").exists())
+
+    def test_a_newer_python3_n_wins_over_an_old_python3(self):
+        # A Mac with Homebrew: /usr/bin/python3 is Apple's 3.9, Homebrew's newest is python3.15 in /opt/homebrew/bin.
+        for launcher, tool in LAUNCHERS.items():
+            with self.subTest(launcher=launcher):
+                for name in (*VERSIONED, "python3", "python"):
+                    (self.bin / name).unlink(missing_ok=True)
+                self.stub("python3", ok=False)
+                self.stub("python3.15")
+                p = self.run_launcher(launcher, "--check")
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertEqual(self.recorded("python3.15"), ["-I", str(ROOT / tool[0]), *tool[1:], "--check"])
+
+    def test_every_versioned_name_is_tried_newest_first(self):
+        for launcher in LAUNCHERS:
+            with self.subTest(launcher=launcher):
+                text = (ROOT / launcher).read_text(encoding="utf-8").replace("\\\n", " ")
+                names = text.split("for py in", 1)[1].split("; do", 1)[0].split()
+                self.assertEqual(names, [*VERSIONED, "python3", "python"])
 
     def test_python3_is_used_when_there_is_no_versioned_name(self):
         self.stub("python3")

@@ -106,6 +106,13 @@ PC_TAIL_SET, PC_TAIL_BINDING = 1, 0
 # can use there.
 F16_HALVES = False
 F16_HALF_TOP = 29
+# --vs-single-lane: each vertex shader invocation is a wave whose only running lane is lane 0, so the VS keeps no
+# subgroup operation and no SubgroupLocalInvocationId (vs_single_lane). Metal has no SIMD-lane index in a vertex
+# function, so MoltenVK's SPIR-V to MSL conversion stops on that built-in ("Subgroup builtins are not available in this
+# type of function", MoltenVK 1.4.2): 1,113 of the 2,236 corpus VS read it, and every pipeline with one of them fails.
+# A wave with one running lane is a state the hardware reaches (the last wave of a draw can hold one vertex), so code
+# that is right on hardware is right here: the program cannot rely on a lane that may not be running.
+VS_SINGLE_LANE = False
 OPT_SPIRV = False       # --opt: run tools/spirv_opt.py basic-block peephole pass on emitted SPIR-V (#884)
 
 
@@ -300,6 +307,11 @@ class Gen:
         self.per_vertex = set()     # PS: attribute numbers read by a *_f16 interp: PerVertexKHR, decoded per half
         self.f16_halves = set()     # PS, --f16-interp-fallback: the same attributes, read from decoded-half inputs
         self.f16_half_locs = {}     # PS/VS/MS, --f16-interp-fallback: attr/param n -> (low_loc, high_loc)
+        # PS, computed I/J pair without PerVertexKHR inputs (--f16-interp-fallback, --bary-fallback): (input variable,
+        # component) -> k, whose P0 and P1 - P0, P2 - P0 the prologue rebuilds from screen-space derivatives
+        # (%ijp0_k, %ijd1_k, %ijd2_k; attribute_rebuilt).
+        self.ij_rebuilt = {}
+        self.single_lane_ballot = False  # --vs-single-lane rewrote a ballot: %v4uint_bal without the capability
         self.param_max = -1         # VS/MS: the highest exp paramN (--f16-interp-fallback keeps halves above it)
         self.f16_half_outs = {}     # VS/MS, --f16-interp-fallback: param n -> its two decoded-half output names
         self.ij_capture = {}        # computed-I/J pairs: pair key -> the I float id the p1 loaded (SHADER-177)
@@ -14682,7 +14694,12 @@ class Gen:
 
         --f16-interp-fallback: an f16 read (`half` 0/1) of an attribute in f16_halves is component `comp` of the smooth
         input at f16_half_location(n, half), which the producer fills with that half decoded to f32 (F16_HALVES).
-        Other reads of such an attribute take the raw word as on any location (smooth, or flat = provoking vertex)."""
+        Other reads of such an attribute take the raw word as on any location (smooth, or flat = provoking vertex).
+
+        Without PerVertexKHR inputs (both fallbacks) a computed-I/J site (`ij`) takes attribute_rebuilt's P0, P1 - P0
+        and P2 - P0, rebuilt from the interpolated input, with the same weighting."""
+        if ij is not None and n not in self.per_vertex and not flat and vertex_delta is None:
+            return self.attribute_rebuilt(n, comp, half, ij)
         if half is not None and n in self.f16_halves:
             name = f"%in_f16h{n}_{half}"
             self.inputs.setdefault(name, None)  # resolved in assemble() once every raw attribute is known
@@ -14732,6 +14749,42 @@ class Gen:
         self.emit(f"{m1} = OpFMul %float {d1} {i}")
         self.emit(f"{s} = OpFAdd %float {pv[0]} {m1}")
         self.emit(f"{m2} = OpFMul %float {d2} {j}")
+        self.emit(f"{r} = OpFAdd %float {s} {m2}")
+        return r
+
+    def attribute_rebuilt(self, n, comp, half, ij):
+        """A computed-I/J site's value without PerVertexKHR inputs (--f16-interp-fallback, --bary-fallback).
+
+        The interpolated input A and the barycentrics (I, J) = %bary.y, .z the device used for it satisfy
+        A = P0 + I(P1 - P0) + J(P2 - P0) at every invocation of a quad, helpers included (they extrapolate the same
+        plane). So the screen-space differences dA = dI (P1 - P0) + dJ (P2 - P0) along x and along y are two
+        equations in the two vertex deltas: solving them gives P1 - P0 and P2 - P0, and A - I(P1 - P0) - J(P2 - P0)
+        gives P0. That holds for perspective-correct I, J too (A is linear in them, not in x and y), for fine and
+        coarse derivatives alike (both sides use the same pair of invocations), and without rounding the result is
+        exact. The prologue solves it once per (input, component), before any branch: derivatives need every
+        invocation of the quad (assemble(), %ij*). Where the 2x2 system is singular (a triangle seen edge-on) the
+        deltas are 0 and the site reads A. The result carries the device's interpolation rounding, amplified by
+        the solve where the triangle covers few pixels, so it is close to the per-vertex path but not bit-exact.
+
+        A 16-bit read (`half`) reads the decoded half the producer exports (--f16-interp-fallback); without one
+        (--bary-fallback alone) there is no input to rebuild from."""
+        if half is not None:
+            if n not in self.f16_halves:
+                raise Unsupported("computed I/J pair: a 16-bit read with neither PerVertexKHR inputs nor decoded "
+                                  "halves")
+            name = f"%in_f16h{n}_{half}"
+            self.inputs.setdefault(name, None)  # resolved in assemble() once every raw attribute is known
+        else:
+            name = f"%in_attr{n}"
+            self.inputs[name] = n
+        self.interpolated.add(name)
+        self.cu(comp)
+        k = self.ij_rebuilt.setdefault((name, comp), len(self.ij_rebuilt))
+        i, j = ij
+        m1, s, m2, r = (self.tmp() for _ in range(4))
+        self.emit(f"{m1} = OpFMul %float %ijd1_{k} {i}")
+        self.emit(f"{s} = OpFAdd %float %ijp0_{k} {m1}")
+        self.emit(f"{m2} = OpFMul %float %ijd2_{k} {j}")
         self.emit(f"{r} = OpFAdd %float {s} {m2}")
         return r
 
@@ -15665,6 +15718,82 @@ def insert_late_constants(gen, out, written):
     out[at:at] = [f"{gen.consts[v]} = OpConstant %uint {v}" for v in late]
 
 
+_SINGLE_LANE_OP = re.compile(r"^(\s*)(%\S+) = (OpGroupNonUniform\w+|OpLoad) (%\S+) (.*)$")
+# Group operations whose Reduce and InclusiveScan over one lane are that lane's value; the exclusive scan of a uint is
+# the operation's identity.
+_SINGLE_LANE_IDENTITY = {"OpGroupNonUniformBitwiseOr": 0, "OpGroupNonUniformBitwiseXor": 0,
+                         "OpGroupNonUniformBitwiseAnd": 0xFFFFFFFF, "OpGroupNonUniformIAdd": 0,
+                         "OpGroupNonUniformUMax": 0, "OpGroupNonUniformUMin": 0xFFFFFFFF,
+                         "OpGroupNonUniformIMul": 1}
+
+
+def vs_single_lane(gen):
+    """--vs-single-lane: rewrite the VS body for a wave whose only running lane is lane 0 (VS_SINGLE_LANE).
+
+    The lane index is 0; a ballot of p is p in bit 0 and no other bit; any (a uniform-branch vote) is p itself; the
+    first running lane, and any lane a shuffle names, is this invocation, as when the wave holds one vertex. EXEC is
+    this invocation's %active, so the ballot of it is the wave's EXEC, bit 0. A ballot bit test becomes plain bit
+    arithmetic. Any other subgroup operation is refused, so nothing is left for a driver without one."""
+    c0, c1, c5, c31 = gen.cu(0), gen.cu(1), gen.cu(5), gen.cu(31)
+    # A straight-line program is still in gen.body here; a branchy one is in its blocks.
+    for b in [gen.body] + gen.blocks + list(gen.x_segs.values()):
+        if b is None:
+            continue
+        out = []
+        for line in b:
+            m = _SINGLE_LANE_OP.match(line)
+            if m is None or (m.group(3) == "OpLoad" and m.group(5) != "%sg_lane"):
+                if "OpGroupNonUniform" in line or "%sg_lane" in line:
+                    raise Unsupported(f"--vs-single-lane: {line.strip()}")
+                out.append(line)
+                continue
+            ind, r, op, ty, rest = m.groups()
+            a = rest.split()
+            if op == "OpLoad":                                  # %sg_lane: the lane index
+                out.append(f"{ind}{r} = OpCopyObject %uint {c0}")
+            elif op in ("OpGroupNonUniformAny", "OpGroupNonUniformAll", "OpGroupNonUniformBroadcastFirst"):
+                out.append(f"{ind}{r} = OpCopyObject {ty} {a[1]}")     # <scope> <value>
+            elif op in ("OpGroupNonUniformShuffle", "OpGroupNonUniformBroadcast", "OpGroupNonUniformShuffleXor",
+                        "OpGroupNonUniformShuffleUp", "OpGroupNonUniformShuffleDown",
+                        "OpGroupNonUniformQuadSwap", "OpGroupNonUniformQuadBroadcast"):
+                out.append(f"{ind}{r} = OpCopyObject {ty} {a[1]}")     # <scope> <value> <lane / delta / dir>
+            elif op == "OpGroupNonUniformElect":
+                out.append(f"{ind}{r} = OpCopyObject %bool %true")
+            elif op in _SINGLE_LANE_IDENTITY and len(a) == 3 and a[1] in ("Reduce", "InclusiveScan"):
+                out.append(f"{ind}{r} = OpCopyObject {ty} {a[2]}")     # <scope> <operation> <value>: this lane's
+            elif op in _SINGLE_LANE_IDENTITY and len(a) == 3 and a[1] == "ExclusiveScan" and ty == "%uint":
+                out.append(f"{ind}{r} = OpCopyObject %uint {gen.cu(_SINGLE_LANE_IDENTITY[op])}")   # nothing before it
+            elif op == "OpGroupNonUniformBallotBitCount" and len(a) == 3:   # <scope> <operation> <uvec4 mask>
+                if a[1] == "ExclusiveScan":
+                    out.append(f"{ind}{r} = OpCopyObject %uint {c0}")          # no lane below lane 0
+                elif a[1] == "InclusiveScan":
+                    out += [f"{ind}{r}_w = OpCompositeExtract %uint {a[2]} 0",
+                            f"{ind}{r} = OpBitwiseAnd %uint {r}_w {c1}"]       # lane 0's own bit
+                elif a[1] == "Reduce":
+                    out += [f"{ind}{r}_w{k} = OpCompositeExtract %uint {a[2]} {k}" for k in range(4)]
+                    out += [f"{ind}{r}_n{k} = OpBitCount %uint {r}_w{k}" for k in range(4)]
+                    out += [f"{ind}{r}_s0 = OpIAdd %uint {r}_n0 {r}_n1", f"{ind}{r}_s1 = OpIAdd %uint {r}_n2 {r}_n3",
+                            f"{ind}{r} = OpIAdd %uint {r}_s0 {r}_s1"]
+                else:
+                    raise Unsupported(f"--vs-single-lane: {op} {a[1]}")
+            elif op == "OpGroupNonUniformBallot":
+                out += [f"{ind}{r}_bit = OpSelect %uint {a[1]} {c1} {c0}",
+                        f"{ind}{r} = OpCompositeConstruct {ty} {r}_bit {c0} {c0} {c0}"]
+                gen.single_lane_ballot = True
+            elif op == "OpGroupNonUniformBallotBitExtract":          # <scope> <uvec4 mask> <lane>
+                out += [f"{ind}{r}_q = OpShiftRightLogical %uint {a[2]} {c5}",
+                        f"{ind}{r}_w = OpVectorExtractDynamic %uint {a[1]} {r}_q",
+                        f"{ind}{r}_l = OpBitwiseAnd %uint {a[2]} {c31}",
+                        f"{ind}{r}_s = OpShiftRightLogical %uint {r}_w {r}_l",
+                        f"{ind}{r}_b = OpBitwiseAnd %uint {r}_s {c1}",
+                        f"{ind}{r} = OpINotEqual %bool {r}_b {c0}"]
+            else:
+                raise Unsupported(f"--vs-single-lane: {op}")
+        b[:] = out
+    gen.uses_subgroup = gen.uses_vote = gen.uses_ballot = gen.uses_wave_bits = gen.uses_quad = False
+    gen.uses_bcast_first = False
+
+
 def assemble(gen):
     store_dims = gen.uses_store_views | gen.uses_store_reads
     vs = gen.stage == "vs"
@@ -15685,6 +15814,8 @@ def assemble(gen):
         gen.msc_epilogue = mesh_compute_epilogue(gen)
     # --pc-tail-ubo: the uniform block exists only when the shader reads the tail (after the epilogue, which reads it).
     gen.uses_pc_tail = PC_TAIL_UBO and (gen.uses_heap or gen.uses_codebase or msc)
+    if VS_SINGLE_LANE and gen.stage == "vs":
+        vs_single_lane(gen)
     if gen.emulate:
         # No subgroup operation is left (x_round does them through %x_buf), so none of their capabilities.
         if any("OpGroupNonUniform" in l or "%sg_lane" in l
@@ -15751,7 +15882,8 @@ def assemble(gen):
         if gen.uses_viewport:
             iface += ["%out_viewport"]
     iface += [f"%vin{reg}" for reg, _ in gen.vertex_inputs] + ["%user_data"] + (["%pc_tail"] if gen.uses_pc_tail else [])
-    bary = any(str(c).startswith("bary") for c in gen.frag_inputs.values()) or bool(gen.per_vertex)
+    bary = any(str(c).startswith("bary") for c in gen.frag_inputs.values()) or bool(gen.per_vertex) or \
+        bool(gen.ij_rebuilt)
     # --bary-fallback: %bary is a plain input at the lowest location no attribute uses, so no capability or
     # extension. Lowest free, not one past the highest: a PS whose only input is attr30 would otherwise put it at 31,
     # past what drivers with 128 input components accept (#804 review).
@@ -16064,7 +16196,7 @@ def assemble(gen):
     # dedupe_types keeps the first uvec4 it meets: when the typed-image types follow, declare the ballot type after
     # them, so a shader that gains a ballot keeps the name %v4uint_st (SHADER-1016).
     st_types = bool(store_dims or gen.uses_int_fetch or gen.uses_d16_image)
-    if gen.uses_ballot and not st_types:
+    if (gen.uses_ballot or gen.single_lane_ballot) and not st_types:
         types.append("%v4uint_bal = OpTypeVector %uint 4")       # dedupe_types merges it with any other uvec4
     if gen.uses_bvh and not any(t.startswith("%v3float = ") for t in types):
         types.append("%v3float = OpTypeVector %float 3")
@@ -16096,7 +16228,7 @@ def assemble(gen):
         types += ["%double = OpTypeFloat 64"]
     if gen.uses_f64 or gen.uses_clock:
         types += ["%v2uint_d = OpTypeVector %uint 2"]
-    if gen.uses_ballot and not st_types:
+    if (gen.uses_ballot or gen.single_lane_ballot) and not st_types:
         types += ["%v4uint_bal = OpTypeVector %uint 4"]
     if gen.uses_fmt_size:
         sizes = [Gen.FORMATS[c][0] if c in Gen.FORMATS else 0 for c in range(128)]
@@ -16123,7 +16255,7 @@ def assemble(gen):
     if store_dims or gen.uses_int_fetch or gen.uses_d16_image:
         u, si = Gen.int_format_masks()
         types += ["%v4uint_st = OpTypeVector %uint 4", "%v4int_st = OpTypeVector %int 4",
-                  *(["%v4uint_bal = OpTypeVector %uint 4"] if gen.uses_ballot else []),
+                  *(["%v4uint_bal = OpTypeVector %uint 4"] if gen.uses_ballot or gen.single_lane_ballot else []),
                   f"%fmt_mask_arr = OpTypeArray %uint {gen.cu(16)}",
                   "%_ptr_Private_fmt = OpTypePointer Private %fmt_mask_arr",
                   "%_ptr_Private_uint = OpTypePointer Private %uint"]
@@ -16462,6 +16594,33 @@ def assemble(gen):
                 continue
             fn += [f"%fc{c} = OpCompositeExtract %float %fc {c}", f"%fcu{c} = OpBitcast %uint %fc{c}",
                    f"%fcp{c} = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(r)}", f"OpStore %fcp{c} %fcu{c}"]
+    if gen.ij_rebuilt:
+        # Computed I/J pairs without PerVertexKHR inputs (Gen.attribute_rebuilt): solve
+        #   dA/dx = dI/dx d1 + dJ/dx d2,  dA/dy = dI/dy d1 + dJ/dy d2
+        # for d1 = P1 - P0, d2 = P2 - P0 by Cramer's rule, then P0 = A - I d1 - J d2. Here in the entry block, before
+        # any branch, every invocation of the quad is running, so the derivatives are defined.
+        fn += ["%ijbc = OpLoad %v3float %bary", "%ijbi = OpCompositeExtract %float %ijbc 1",
+               "%ijbj = OpCompositeExtract %float %ijbc 2",
+               "%ijix = OpDPdx %float %ijbi", "%ijiy = OpDPdy %float %ijbi",
+               "%ijjx = OpDPdx %float %ijbj", "%ijjy = OpDPdy %float %ijbj",
+               "%ijq0 = OpFMul %float %ijix %ijjy", "%ijq1 = OpFMul %float %ijjx %ijiy",
+               "%ijdet = OpFSub %float %ijq0 %ijq1",
+               # det 0 (an edge-on triangle, or a quad whose invocations share one I/J): no deltas, the site reads A
+               "%ijsing = OpFOrdEqual %bool %ijdet %f0",
+               "%ijden = OpSelect %float %ijsing %f1 %ijdet"]     # never a division by 0 (undefined)
+        for (name, comp), k in gen.ij_rebuilt.items():
+            fn += [f"%ijap{k} = OpAccessChain %_ptr_Input_float {name} {gen.cu(comp)}",
+                   f"%ija{k} = OpLoad %float %ijap{k}",
+                   f"%ijax{k} = OpDPdx %float %ija{k}", f"%ijay{k} = OpDPdy %float %ija{k}",
+                   f"%ijn1a{k} = OpFMul %float %ijax{k} %ijjy", f"%ijn1b{k} = OpFMul %float %ijay{k} %ijjx",
+                   f"%ijn1{k} = OpFSub %float %ijn1a{k} %ijn1b{k}",
+                   f"%ijn2a{k} = OpFMul %float %ijix %ijay{k}", f"%ijn2b{k} = OpFMul %float %ijiy %ijax{k}",
+                   f"%ijn2{k} = OpFSub %float %ijn2a{k} %ijn2b{k}",
+                   f"%ijr1{k} = OpFDiv %float %ijn1{k} %ijden", f"%ijr2{k} = OpFDiv %float %ijn2{k} %ijden",
+                   f"%ijd1_{k} = OpSelect %float %ijsing %f0 %ijr1{k}",
+                   f"%ijd2_{k} = OpSelect %float %ijsing %f0 %ijr2{k}",
+                   f"%ijo1{k} = OpFMul %float %ijbi %ijd1_{k}", f"%ijo2{k} = OpFMul %float %ijbj %ijd2_{k}",
+                   f"%ijs{k} = OpFSub %float %ija{k} %ijo1{k}", f"%ijp0_{k} = OpFSub %float %ijs{k} %ijo2{k}"]
     for reg, ctype in gen.vertex_inputs:
         vt = {1: "%v4uint_in", 2: "%v4int_in"}.get(ctype, "%v4float")
         st = {1: "%uint", 2: "%int"}.get(ctype, "%float")
@@ -17280,11 +17439,11 @@ def interp_ij_analysis(insns, g):
         if s["src"] in (0, 1):
             g.frag_inputs[s["src"]] = ("bary_i", "bary_j")[s["src"]]
         attrs.add(s["attr"])
-    if attrs and BARY_FALLBACK:
-        raise Unsupported("computed I/J pair under --bary-fallback: no PerVertexKHR inputs")
-    if attrs and F16_HALVES:
-        # --f16-interp-fallback reads decoded halves from the producer: no per-vertex inputs either
-        raise Unsupported("computed I/J pair under --f16-interp-fallback: no PerVertexKHR inputs")
+    if BARY_FALLBACK or F16_HALVES:
+        # Neither fallback has PerVertexKHR inputs (--f16-interp-fallback reads decoded halves from the producer).
+        # attribute() rebuilds each computed site's P0, P1 - P0 and P2 - P0 from the interpolated input instead
+        # (attribute_rebuilt), so no attribute becomes per-vertex.
+        return set()
     return attrs
 
 
@@ -19494,6 +19653,10 @@ def main():
                     help="16-bit interpolation without PerVertexKHR inputs, for devices that can't compile them "
                          "(MoltenVK): VS and mesh params also export their f16 halves decoded to f32, which the PS "
                          "reads as ordinary interpolated inputs (metadata: f16_halves)")
+    ap.add_argument("--vs-single-lane", action="store_true",
+                    help="translate each vertex shader invocation as a wave whose only running lane is lane 0, with no "
+                         "subgroup operation or lane index left, for devices whose vertex stage has none (MoltenVK: "
+                         "Metal vertex functions have no SIMD-lane index)")
     ap.add_argument("--max-shared-memory", type=int, default=MAX_SHARED_BYTES, metavar="BYTES",
                     help="cap on a compute shader's workgroup memory, its LDS plus what --wave64-emulate adds "
                          "(default %(default)s, the 64 KiB hard cap): over it the LDS array shrinks to the program's "
@@ -19537,6 +19700,7 @@ def main():
     LOOP_LIMIT = a.loop_limit
     MAX_STRUCTURED_DEPTH = a.max_structured_depth
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV
+    global VS_SINGLE_LANE
     global PC_TAIL_UBO
     PC_TAIL_UBO = a.pc_tail_ubo
     global FMA_EXACT
@@ -19552,6 +19716,7 @@ def main():
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
     MESH_COMPUTE = a.mesh_compute
     F16_HALVES = a.f16_interp_fallback
+    VS_SINGLE_LANE = a.vs_single_lane
     OPT_SPIRV = a.opt
     if a.merge:
         try:

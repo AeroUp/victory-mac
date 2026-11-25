@@ -11,7 +11,9 @@ argument before the closing quote.
 
 With LLVM_MC unset, the plain name llvm-mc is used when it is on PATH. Debian and Ubuntu install `llvm-<N>` under
 versioned names only (/usr/bin/llvm-mc-<N> and /usr/lib/llvm-<N>/bin/llvm-mc; the plain name comes with the
-unversioned `llvm` package), so off Windows the newest of those is used when the plain name is missing.
+unversioned `llvm` package), so off Windows the newest of those is used when the plain name is missing. On macOS,
+Homebrew's `llvm` and `llvm@<N>` are keg-only, never linked onto PATH: their bin folders under /opt/homebrew/opt
+(Apple Silicon) or /usr/local/opt (Intel) come last.
 
 run() starts such a command and turns a missing llvm-mc into one line instead of a FileNotFoundError traceback.
 """
@@ -107,12 +109,53 @@ def versioned_llvm_mc() -> str | None:
     return found[max(found)] if found else None
 
 
+HOMEBREW_OPT = ("/opt/homebrew/opt", "/usr/local/opt")   # Apple Silicon, Intel
+
+
+def homebrew_keg_bins(*formulas: str) -> list[str]:
+    """macOS: the bin folders of the keg-only Homebrew formulas named (e.g. "llvm", "lld") that are installed, the
+    unversioned keg of each first and then its formula@<N> kegs, newest first. Homebrew never links these onto PATH.
+    It also links opt/<formula>@<major> to the current keg, so a folder whose real path came already is left out.
+    Empty off macOS. Only folders are looked at; nothing is started."""
+    if sys.platform != "darwin":
+        return []
+    found = []
+    for opt in HOMEBREW_OPT:
+        for formula in formulas:
+            plain = os.path.join(opt, formula, "bin")
+            if os.path.isdir(plain):
+                found.append(plain)
+            versioned = []
+            for path in glob.glob(os.path.join(glob.escape(opt), glob.escape(formula) + "@*", "bin")):
+                m = re.fullmatch(re.escape(formula) + r"@(\d+)", os.path.basename(os.path.dirname(path)))
+                if m and os.path.isdir(path):
+                    versioned.append((int(m.group(1)), path))
+            found.extend(path for _, path in sorted(versioned, reverse=True))
+    seen, unique = set(), []
+    for path in found:
+        real = os.path.realpath(path)
+        if real not in seen:
+            seen.add(real)
+            unique.append(path)
+    return unique
+
+
+def homebrew_llvm_mc() -> str | None:
+    """macOS: llvm-mc from Homebrew's keg-only llvm (or the newest llvm@<N>), or None."""
+    for folder in homebrew_keg_bins("llvm"):
+        path = os.path.join(folder, "llvm-mc")
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
 def default_command() -> str:
     """llvm-mc when the plain name is on PATH (the name a work folder's disassembly record already holds), else
-    versioned_llvm_mc(), else the plain name, which then fails with not_found()'s message."""
+    versioned_llvm_mc(), else Homebrew's keg on macOS, else the plain name, which then fails with not_found()'s
+    message."""
     if shutil.which("llvm-mc"):
         return "llvm-mc"
-    return versioned_llvm_mc() or "llvm-mc"
+    return versioned_llvm_mc() or homebrew_llvm_mc() or "llvm-mc"
 
 
 def mc_command(raw: str | None = None) -> list:
@@ -130,8 +173,9 @@ def install_hint() -> str:
                 "scripts\\build_llvm_mc.ps1 (it sets LLVM_MC), or install llvm-21 in WSL and set LLVM_MC to the "
                 "whole command, e.g.\n  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
     if sys.platform == "darwin":
-        return ("Homebrew's llvm has the AMDGPU target but is keg-only (not on PATH): brew install llvm, then\n"
-                "  LLVM_MC=\"$(brew --prefix llvm)/bin/llvm-mc\"")
+        return ("Homebrew's llvm has the AMDGPU target: brew install llvm. It is keg-only (not on PATH) and found in\n"
+                "/opt/homebrew/opt/llvm/bin (/usr/local/opt/llvm/bin on Intel) without further setup; set\n"
+                "LLVM_MC=/path/to/llvm-mc to use another one")
     return ("Distribution LLVM packages include the AMDGPU target: on Debian or Ubuntu, sudo apt install llvm-21\n"
             "(found as /usr/lib/llvm-21/bin/llvm-mc without further setup); elsewhere install your distribution's\n"
             "LLVM 21+ package and put llvm-mc on PATH, or set LLVM_MC=/path/to/llvm-mc")

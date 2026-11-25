@@ -31,8 +31,34 @@ target_link_libraries(root_signature_test PRIVATE gta6rt_root_signature)
 # AVX, OSXSAVE and XCR0 YMM state from synthetic CPUID/XCR0 words, plus one call on the real host.
 add_executable(host_cpu_test test/host_cpu_test.cpp src/host_cpu.cpp)
 target_include_directories(host_cpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# ADCX/ADOX emulation (src/cpu_emulation.h, docs/macos.md): decoder, arithmetic and addressing on every OS, and on an
+# x86-64 Linux or macOS host the real instructions, through a SIGILL handler where the CPU has no ADX.
+add_executable(cpu_emulation_adx_test test/cpu_emulation_adx_test.cpp)
+target_include_directories(cpu_emulation_adx_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# On an Apple Silicon Mac the same test again as x86-64, so it runs under Rosetta 2: the translator that runs the
+# Windows runtime under Wine there, and which has no ADX. Only where Rosetta is installed (`arch -x86_64` runs).
+if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$" AND NOT CMAKE_OSX_ARCHITECTURES MATCHES "x86_64")
+  execute_process(COMMAND arch -x86_64 /usr/bin/true RESULT_VARIABLE _gta6rt_rosetta OUTPUT_QUIET ERROR_QUIET)
+  if(_gta6rt_rosetta EQUAL 0)
+    add_executable(cpu_emulation_adx_rosetta_test test/cpu_emulation_adx_test.cpp)
+    target_include_directories(cpu_emulation_adx_rosetta_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    set_target_properties(cpu_emulation_adx_rosetta_test PROPERTIES OSX_ARCHITECTURES x86_64)
+    add_executable(adx_rewrite_rosetta_test test/adx_rewrite_test.cpp)
+    target_include_directories(adx_rewrite_rosetta_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    set_target_properties(adx_rewrite_rosetta_test PROPERTIES OSX_ARCHITECTURES x86_64)
+  endif()
+endif()
+# ADCX/ADOX rewritten to exact stubs before the image runs (src/adx_rewrite.h) and the instruction lengths its sweep
+# walks with (src/x86_length.h): lengths, sweep, stub bytes and fault mapping on every OS; on an x86-64 host the
+# rewritten routines run, under Rosetta 2 through adx_rewrite_rosetta_test above, on Windows with rewrite()'s handler.
+add_executable(adx_rewrite_test test/adx_rewrite_test.cpp)
+target_include_directories(adx_rewrite_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# x86_length.h's length per line of hex, for test/check_x86_length.py's comparison with llvm-mc.
+add_executable(x86_length_dump test/x86_length_dump.cpp)
+target_include_directories(x86_length_dump PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 if(MSVC)
-  foreach(_portable gta6rt_root_signature root_signature_test host_cpu_test)
+  foreach(_portable gta6rt_root_signature root_signature_test host_cpu_test cpu_emulation_adx_test adx_rewrite_test
+                    x86_length_dump)
     target_compile_definitions(${_portable} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(${_portable} PRIVATE /W4 /permissive- /utf-8)
   endforeach()
@@ -1710,6 +1736,26 @@ if(BUILD_TESTING)
   if(TARGET host_cpu_test)
     add_test(NAME host_cpu COMMAND host_cpu_test)
   endif()
+  if(TARGET cpu_emulation_adx_test)
+    add_test(NAME cpu_emulation_adx COMMAND cpu_emulation_adx_test)
+  endif()
+  if(TARGET cpu_emulation_adx_rosetta_test)
+    add_test(NAME cpu_emulation_adx_rosetta COMMAND cpu_emulation_adx_rosetta_test)
+  endif()
+  if(TARGET adx_rewrite_test)
+    add_test(NAME adx_rewrite COMMAND adx_rewrite_test)
+  endif()
+  if(TARGET adx_rewrite_rosetta_test)
+    add_test(NAME adx_rewrite_rosetta COMMAND adx_rewrite_rosetta_test)
+  endif()
+  # Every length llvm-mc's disassembler decodes on 200,000 generated cases; skipped (77) without llvm-mc. In a cross
+  # build the dump is a Windows program, started through the emulator.
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(TARGET x86_length_dump AND Python3_FOUND)
+    add_test(NAME x86_length COMMAND "${Python3_EXECUTABLE}" -I "${CMAKE_CURRENT_SOURCE_DIR}/test/check_x86_length.py"
+             ${CMAKE_CROSSCOMPILING_EMULATOR} "$<TARGET_FILE:x86_length_dump>")
+    set_tests_properties(x86_length PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
   if(WIN32 AND TARGET root_signature_oracle_test)
     add_test(NAME root_signature_oracle COMMAND root_signature_oracle_test)
   endif()
@@ -1800,9 +1846,14 @@ if(TARGET Vulkan::Headers)
   # device fails the run in vk_descriptor_bench and vk_sandbox too, instead of testing another GPU (TEST-1141).
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_FOUND)
+    # The tools are Windows executables in a cross build: the script starts them through the emulator (Wine).
+    set(_filter_runner)
+    foreach(_part IN LISTS CMAKE_CROSSCOMPILING_EMULATOR)
+      list(APPEND _filter_runner "--runner=${_part}")
+    endforeach()
     add_test(NAME vk_device_filter_tools COMMAND "${Python3_EXECUTABLE}" -I
              "${CMAKE_CURRENT_SOURCE_DIR}/test/check_device_filter_tools.py" "$<TARGET_FILE:vk_descriptor_bench>"
-             "$<TARGET_FILE:vk_sandbox>" "${CMAKE_CURRENT_BINARY_DIR}/vk_device_filter_tools")
+             "$<TARGET_FILE:vk_sandbox>" "${CMAKE_CURRENT_BINARY_DIR}/vk_device_filter_tools" ${_filter_runner})
     set_tests_properties(vk_device_filter_tools PROPERTIES SKIP_RETURN_CODE 77)
   endif()
   if(MSVC)

@@ -77,10 +77,6 @@ int main() {
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;  // no Vulkan GPU: ctest skips
     EXPECT(device_status == vktest::DeviceStatus::ready);
-    if (!d.enabled.geometryShader) {
-        std::printf("SKIP: no geometryShader on this GPU\n");
-        return 77;
-    }
     const std::filesystem::path root_dir = LEONIDA_TEST_M15_DIR;
     const auto vs_program = read_file(root_dir / "fssm" / "vs_m15.fssm");
     const auto ps_program = read_file(root_dir / "fssm" / "ps_m15.fssm");

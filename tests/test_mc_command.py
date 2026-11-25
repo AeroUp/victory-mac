@@ -133,7 +133,8 @@ class SplitCommandTest(unittest.TestCase):
     def test_mc_command_without_any_llvm_mc_keeps_the_plain_name(self):
         with mock.patch.dict(os.environ, {"LLVM_MC": ""}), \
              mock.patch.object(mc_command.shutil, "which", return_value=None), \
-             mock.patch.object(mc_command, "versioned_llvm_mc", return_value=None):
+             mock.patch.object(mc_command, "versioned_llvm_mc", return_value=None), \
+             mock.patch.object(mc_command, "homebrew_llvm_mc", return_value=None):
             self.assertEqual(mc_command.mc_command(), ["llvm-mc"])
 
 
@@ -159,8 +160,10 @@ class VersionedLlvmMcTest(unittest.TestCase):
 
     def found(self):
         pattern = os.path.join(self.lib, "llvm-*", "bin", "llvm-mc")
+        # HOMEBREW_OPT: an empty folder, so a Mac's own Homebrew llvm is not found instead.
         with mock.patch.dict(os.environ, {"PATH": self.bin, "LLVM_MC": ""}), \
-             mock.patch.object(mc_command, "DEBIAN_LLVM_MC", pattern):
+             mock.patch.object(mc_command, "DEBIAN_LLVM_MC", pattern), \
+             mock.patch.object(mc_command, "HOMEBREW_OPT", (os.path.join(self.tmp.name, "opt"),)):
             return mc_command.versioned_llvm_mc(), mc_command.mc_command()
 
     def test_nothing_installed(self):
@@ -200,6 +203,76 @@ class VersionedLlvmMcTest(unittest.TestCase):
             message = mc_command.not_found("llvm-mc", FileNotFoundError(2, "No such file"))
         self.assertIn("apt install llvm-21", message)
         self.assertNotIn("build_llvm_mc.ps1", message)
+
+
+@unittest.skipIf(os.name == "nt", "Homebrew kegs are a macOS layout")
+class HomebrewLlvmMcTest(unittest.TestCase):
+    """Homebrew's llvm and llvm@<N> are keg-only: <prefix>/opt/llvm/bin/llvm-mc is never on PATH."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.opt = os.path.join(self.tmp.name, "opt")
+        self.bin = os.path.join(self.tmp.name, "bin")
+        os.makedirs(self.opt)
+        os.makedirs(self.bin)
+
+    def found(self, platform="darwin"):
+        with mock.patch.dict(os.environ, {"PATH": self.bin, "LLVM_MC": ""}), \
+             mock.patch.object(mc_command.sys, "platform", platform), \
+             mock.patch.object(mc_command, "DEBIAN_LLVM_MC", os.path.join(self.tmp.name, "none", "llvm-mc")), \
+             mock.patch.object(mc_command, "HOMEBREW_OPT", (self.opt,)):
+            return mc_command.homebrew_llvm_mc(), mc_command.mc_command()
+
+    def test_nothing_installed(self):
+        self.assertEqual(self.found(), (None, ["llvm-mc"]))
+
+    def test_the_unversioned_keg_wins(self):
+        want = _executable(os.path.join(self.opt, "llvm", "bin", "llvm-mc"))
+        _executable(os.path.join(self.opt, "llvm@22", "bin", "llvm-mc"))
+        self.assertEqual(self.found(), (want, [want]))
+
+    def test_then_the_newest_versioned_keg_by_number(self):
+        _executable(os.path.join(self.opt, "llvm@9", "bin", "llvm-mc"))
+        want = _executable(os.path.join(self.opt, "llvm@21", "bin", "llvm-mc"))
+        _executable(os.path.join(self.opt, "llvmlite", "bin", "llvm-mc"))   # another formula, not llvm@<N>
+        self.assertEqual(self.found(), (want, [want]))
+
+    def test_only_on_macos(self):
+        _executable(os.path.join(self.opt, "llvm", "bin", "llvm-mc"))
+        self.assertEqual(self.found(platform="linux"), (None, ["llvm-mc"]))
+
+    def test_the_plain_name_on_path_is_kept(self):
+        _executable(os.path.join(self.opt, "llvm", "bin", "llvm-mc"))
+        _executable(os.path.join(self.bin, "llvm-mc"))
+        self.assertEqual(self.found()[1], ["llvm-mc"])
+
+    def test_kegs_of_two_formulas_in_order(self):
+        llvm = os.path.join(self.opt, "llvm", "bin")
+        lld = os.path.join(self.opt, "lld@21", "bin")
+        os.makedirs(llvm)
+        os.makedirs(lld)
+        with mock.patch.object(mc_command.sys, "platform", "darwin"), \
+             mock.patch.object(mc_command, "HOMEBREW_OPT", (self.opt,)):
+            self.assertEqual(mc_command.homebrew_keg_bins("llvm", "lld"), [llvm, lld])
+
+    def test_the_versioned_alias_of_the_current_keg_counts_once(self):
+        # Homebrew links opt/llvm and opt/llvm@23 to the same Cellar folder.
+        cellar = os.path.join(self.tmp.name, "Cellar", "llvm", "23.1.6")
+        os.makedirs(os.path.join(cellar, "bin"))
+        os.symlink(cellar, os.path.join(self.opt, "llvm"))
+        os.symlink(cellar, os.path.join(self.opt, "llvm@23"))
+        older = os.path.join(self.opt, "llvm@21", "bin")
+        os.makedirs(older)
+        with mock.patch.object(mc_command.sys, "platform", "darwin"), \
+             mock.patch.object(mc_command, "HOMEBREW_OPT", (self.opt,)):
+            self.assertEqual(mc_command.homebrew_keg_bins("llvm"), [os.path.join(self.opt, "llvm", "bin"), older])
+
+    def test_the_message_says_where_it_is_found(self):
+        with mock.patch.object(mc_command.sys, "platform", "darwin"):
+            hint = mc_command.install_hint()
+        self.assertIn("brew install llvm", hint)
+        self.assertIn("/opt/homebrew/opt/llvm/bin", hint)
 
 
 class MissingLlvmMcTest(unittest.TestCase):

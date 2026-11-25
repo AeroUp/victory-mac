@@ -7183,15 +7183,16 @@ public:
             return stream_unsupported("geometry shaders need the Vulkan geometryShader feature; stage", 0);
         }
         // The console's rectangle topology type (19) draws as triangles through a generated geometry stage that adds
-        // each rectangle's fourth corner (src/rect_list_geometry.h); it needs the same device feature, and no GS of
-        // the application's own.
+        // each rectangle's fourth corner (src/rect_list_geometry.h), or through a rewritten vertex shader when the
+        // device lacks geometryShader (e.g. MoltenVK); neither allows an application GS.
         // Decode the ABI field as bits. The console's value is outside the PC enum's range.
         const auto topology_type = std::bit_cast<std::uint32_t>(desc.PrimitiveTopologyType);
         const bool rect_list = !mesh && topology_type == leonida::topology_type_rect_list;
-        if (rect_list && (geometry || !device_.info.features.geometryShader)) {
-            log_once("a rectangle-list pipeline needs the geometryShader feature and no geometry shader; stage", 0);
-            return geometry ? E_INVALIDARG : E_NOTIMPL;
+        if (rect_list && geometry) {
+            log_once("a rectangle-list pipeline cannot also have a geometry shader; stage", 0);
+            return E_INVALIDARG;
         }
+        const bool rect_via_vertex = rect_list && !device_.info.features.geometryShader;
         if (geometry && topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) {
             log_once("a translated geometry shader takes triangles; topology type", topology_type);
             return E_INVALIDARG;
@@ -7393,6 +7394,18 @@ public:
         const auto topology_bits = std::bit_cast<std::uint32_t>(desc.PrimitiveTopologyType);
         if (!mesh && topology_bits != leonida::topology_type_rect_list)
             graphics_.rectangle_variant_topology = leonida::topology_rect_list;
+        std::vector<std::uint32_t> rect_static_in_locs;
+        if (rect_via_vertex) {
+            std::string why;
+            std::vector<std::uint32_t> wrapped = leonida::rect_list_vertex(vs_stage.words, why, &rect_static_in_locs);
+            if (wrapped.empty()) {
+                std::fprintf(stderr, "[rt] d3d12: %s cannot be drawn as a rectangle list without geometryShader: %s\n",
+                             vs_stage.entry->name.c_str(), why.c_str());
+                return stream_unsupported("rectangle-list vertex shader rewrite failed");
+            }
+            vs_stage.words = std::move(wrapped);
+            graphics_.rectangle_expand_in_vs = true;
+        }
 
         for (Stage& stage : stages) {
             if (!stage.entry) continue;
@@ -7416,14 +7429,17 @@ public:
             VkShaderModule module = VK_NULL_HANDLE;
             if (lazy_) {
                 const bool patched = depth24_fragment && stage.bit == VK_SHADER_STAGE_FRAGMENT_BIT;
-                sources_.push_back({StageSource::library, std::uint8_t(&stage - stages), patched, stage.entry});
+                const bool rect_vs = rect_via_vertex && stage.bit == VK_SHADER_STAGE_VERTEX_BIT;
+                sources_.push_back({StageSource::library, std::uint8_t(&stage - stages), patched, rect_vs, stage.entry});
             } else {
                 module = shader_module(stage.words);
                 if (!module) return E_FAIL;
             }
-            if (stage.bit == VK_SHADER_STAGE_VERTEX_BIT && !geometry && device_.info.features.geometryShader &&
+            if (stage.bit == VK_SHADER_STAGE_VERTEX_BIT && !geometry &&
                 topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) {
                 rectangle_capable_ = true;
+                rectangle_via_vertex_ = !device_.info.features.geometryShader;
+                if (rectangle_via_vertex_) graphics_.rectangle_expand_in_vs = true;
                 if (!lazy_) rectangle_vertex_ = modules_.back();
             }
             VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
@@ -7433,7 +7449,7 @@ public:
             subgroup_size_for(*stage.entry, required_sizes[stage_infos.size()], info);
             stage_infos.push_back(info);
         }
-        if (rect_list) {  // the stage that adds each rectangle's fourth corner, from the vertex shader's outputs
+        if (rect_list && !rect_via_vertex) {  // the stage that adds each rectangle's fourth corner, from the vertex shader's outputs
             std::string why;
             const std::vector<std::uint32_t> words = leonida::rect_list_geometry(vs_stage.words, why);
             if (words.empty()) {
@@ -7527,6 +7543,31 @@ public:
                 std::fprintf(stderr, "[rt] d3d12: the input layout does not feed %s%u (register %u)\n",
                              e.semantic.c_str(), e.semantic_index, e.register_index);
                 return E_INVALIDARG;
+            }
+        }
+        if (rect_via_vertex && !rect_static_in_locs.empty()) {
+            std::vector<VkVertexInputBindingDescription> exp_bindings;
+            std::vector<VkVertexInputAttributeDescription> exp_attrs;
+            std::string why;
+            if (!expand_rect_vertex_inputs(bindings, attributes, rect_static_in_locs, exp_bindings, exp_attrs, why)) {
+                std::fprintf(stderr, "[rt] d3d12: %s cannot be drawn as a rectangle list without geometryShader: %s\n",
+                             vs_stage.entry->name.c_str(), why.c_str());
+                return stream_unsupported("rectangle-list vertex input expansion failed");
+            }
+            graphics_.rect_vertex_slots.clear();
+            for (const auto& b : bindings) graphics_.rect_vertex_slots.push_back(b.binding);
+            graphics_.rectangle_instanced_inputs = true;
+            bindings = std::move(exp_bindings);
+            attributes = std::move(exp_attrs);
+            divisors.clear();
+        } else if (rectangle_via_vertex_ && !bindings.empty()) {
+            const bool per_vertex_only = bindings.size() * 3 <= 31 &&
+                std::all_of(bindings.begin(), bindings.end(),
+                            [](const auto& b) { return b.inputRate == VK_VERTEX_INPUT_RATE_VERTEX; });
+            if (per_vertex_only) {
+                graphics_.rect_vertex_slots.clear();
+                for (const auto& b : bindings) graphics_.rect_vertex_slots.push_back(b.binding);
+                graphics_.rectangle_instanced_inputs = true;
             }
         }
         VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -8245,54 +8286,122 @@ private:
             }
         }
         VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};
-        // A triangle-family pipeline drawn as a rectangle list: the same stages plus the generated geometry stage.
+        // A triangle-family pipeline drawn as a rectangle list: either the same stages plus the generated geometry
+        // stage (when geometryShader is available), or the vertex stage rewritten by rect_list_vertex() otherwise.
         std::vector<VkPipelineShaderStageCreateInfo> rectangle_stages;
+        std::vector<VkVertexInputBindingDescription> rect_bindings;
+        std::vector<VkVertexInputAttributeDescription> rect_attributes;
         if (unbound & leonida::GraphicsPipeline::rectangle_stage) {
             VkShaderModule rectangle = VK_NULL_HANDLE;
             if (!rectangle_capable_) {
                 drop_modules();
                 return VK_NULL_HANDLE;
             }
-            if (lazy_) {
-                std::size_t vs = SIZE_MAX;
-                for (std::size_t i = 0; i < sources_.size(); ++i)
-                    if (sources_[i].kind == StageSource::library && sources_[i].slot == 0) vs = i;
-                std::string why;
-                const std::vector<std::uint32_t> geometry_words =
-                    vs == SIZE_MAX ? std::vector<std::uint32_t>{} : leonida::rect_list_geometry(words[vs], why);
-                VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-                module_info.codeSize = geometry_words.size() * 4;
-                module_info.pCode = geometry_words.data();
-                if (geometry_words.empty() ||
-                    device_.context->vk.vkCreateShaderModule(device_.info.device, &module_info, nullptr, &rectangle) !=
-                        VK_SUCCESS) {
-                    std::fprintf(stderr, "[rt] d3d12: cannot draw rectangle list: %s\n", why.c_str());
-                    drop_modules();
-                    return VK_NULL_HANDLE;
-                }
-                made.push_back(rectangle);
-                bytes += module_info.codeSize;
-                rectangle_stages = stages;
-            } else {
-                if (!rectangle_vertex_) return VK_NULL_HANDLE;
-                if (!rectangle_module_) {
+            if (rectangle_via_vertex_) {
+                std::vector<std::uint32_t> rect_in_locs;
+                if (lazy_) {
+                    std::size_t vs = SIZE_MAX;
+                    for (std::size_t i = 0; i < sources_.size(); ++i)
+                        if (sources_[i].kind == StageSource::library && sources_[i].slot == 0) vs = i;
                     std::string why;
-                    const auto geometry_words = leonida::rect_list_geometry(rectangle_vertex_->words, why);
-                    if (geometry_words.empty()) {
-                        std::fprintf(stderr, "[rt] d3d12: cannot draw rectangle list: %s\n", why.c_str());
+                    const std::vector<std::uint32_t> wrapped =
+                        vs == SIZE_MAX ? std::vector<std::uint32_t>{}
+                                       : leonida::rect_list_vertex(words[vs], why, &rect_in_locs);
+                    VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+                    module_info.codeSize = wrapped.size() * 4;
+                    module_info.pCode = wrapped.data();
+                    if (wrapped.empty() ||
+                        device_.context->vk.vkCreateShaderModule(device_.info.device, &module_info, nullptr, &rectangle) !=
+                            VK_SUCCESS) {
+                        std::fprintf(stderr, "[rt] d3d12: cannot draw rectangle list without geometryShader: %s\n", why.c_str());
+                        drop_modules();
                         return VK_NULL_HANDLE;
                     }
-                    rectangle_module_ = shader_module(geometry_words);
-                    if (!rectangle_module_) return VK_NULL_HANDLE;
+                    made.push_back(rectangle);
+                    bytes += module_info.codeSize;
+                    rectangle_stages = stages;
+                    rectangle_stages[vs].module = rectangle;
+                } else {
+                    if (!rectangle_vertex_) return VK_NULL_HANDLE;
+                    if (!rectangle_module_) {
+                        std::string why;
+                        const auto wrapped = leonida::rect_list_vertex(rectangle_vertex_->words, why, &rectangle_in_locs_);
+                        if (wrapped.empty()) {
+                            std::fprintf(stderr, "[rt] d3d12: cannot draw rectangle list without geometryShader: %s\n", why.c_str());
+                            return VK_NULL_HANDLE;
+                        }
+                        rectangle_module_ = shader_module(wrapped);
+                        if (!rectangle_module_) return VK_NULL_HANDLE;
+                    }
+                    rect_in_locs = rectangle_in_locs_;
+                    rectangle_stages = r.stages;
+                    bool replaced = false;
+                    for (auto& st : rectangle_stages) {
+                        if (st.stage == VK_SHADER_STAGE_VERTEX_BIT) {
+                            st.module = rectangle_module_;
+                            replaced = true;
+                            break;
+                        }
+                    }
+                    if (!replaced) return VK_NULL_HANDLE;
                 }
-                rectangle = rectangle_module_;
-                rectangle_stages = r.stages;
+                if (!rect_in_locs.empty()) {
+                    std::string why;
+                    if (!expand_rect_vertex_inputs(r.bindings, r.attributes, rect_in_locs, rect_bindings,
+                                                   rect_attributes, why)) {
+                        std::fprintf(stderr, "[rt] d3d12: cannot draw rectangle list without geometryShader: %s\n",
+                                     why.c_str());
+                        drop_modules();
+                        return VK_NULL_HANDLE;
+                    }
+                    vertex_input.pNext = nullptr;
+                    vertex_input.vertexBindingDescriptionCount = std::uint32_t(rect_bindings.size());
+                    vertex_input.pVertexBindingDescriptions = rect_bindings.data();
+                    vertex_input.vertexAttributeDescriptionCount = std::uint32_t(rect_attributes.size());
+                    vertex_input.pVertexAttributeDescriptions = rect_attributes.data();
+                }
+            } else {
+                if (lazy_) {
+                    std::size_t vs = SIZE_MAX;
+                    for (std::size_t i = 0; i < sources_.size(); ++i)
+                        if (sources_[i].kind == StageSource::library && sources_[i].slot == 0) vs = i;
+                    std::string why;
+                    const std::vector<std::uint32_t> geometry_words =
+                        vs == SIZE_MAX ? std::vector<std::uint32_t>{} : leonida::rect_list_geometry(words[vs], why);
+                    VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+                    module_info.codeSize = geometry_words.size() * 4;
+                    module_info.pCode = geometry_words.data();
+                    if (geometry_words.empty() ||
+                        device_.context->vk.vkCreateShaderModule(device_.info.device, &module_info, nullptr, &rectangle) !=
+                            VK_SUCCESS) {
+                        std::fprintf(stderr, "[rt] d3d12: cannot draw rectangle list: %s\n", why.c_str());
+                        drop_modules();
+                        return VK_NULL_HANDLE;
+                    }
+                    made.push_back(rectangle);
+                    bytes += module_info.codeSize;
+                    rectangle_stages = stages;
+                } else {
+                    if (!rectangle_vertex_) return VK_NULL_HANDLE;
+                    if (!rectangle_module_) {
+                        std::string why;
+                        const auto geometry_words = leonida::rect_list_geometry(rectangle_vertex_->words, why);
+                        if (geometry_words.empty()) {
+                            std::fprintf(stderr, "[rt] d3d12: cannot draw rectangle list: %s\n", why.c_str());
+                            return VK_NULL_HANDLE;
+                        }
+                        rectangle_module_ = shader_module(geometry_words);
+                        if (!rectangle_module_) return VK_NULL_HANDLE;
+                    }
+                    rectangle = rectangle_module_;
+                    rectangle_stages = r.stages;
+                }
+                VkPipelineShaderStageCreateInfo geometry{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+                geometry.stage = VK_SHADER_STAGE_GEOMETRY_BIT;
+                geometry.module = rectangle;
+                geometry.pName = "main";
+                rectangle_stages.push_back(geometry);
             }
-            VkPipelineShaderStageCreateInfo geometry{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-            geometry.stage = VK_SHADER_STAGE_GEOMETRY_BIT;
-            geometry.module = rectangle;
-            geometry.pName = "main";
-            rectangle_stages.push_back(geometry);
         }
         const auto& pipeline_stages = !rectangle_stages.empty() ? rectangle_stages : lazy_ ? stages : r.stages;
         info.stageCount = std::uint32_t(pipeline_stages.size());
@@ -8373,6 +8482,11 @@ private:
             words[i] = std::move(patched);
         }
         for (std::size_t i = 0; i < sources_.size(); ++i) {
+            if (sources_[i].rect_vertex) {
+                std::vector<std::uint32_t> wrapped = leonida::rect_list_vertex(words[i], why);
+                if (wrapped.empty()) return false;
+                words[i] = std::move(wrapped);
+            }
             if (sources_[i].kind == StageSource::rect_list) {
                 if (vs == SIZE_MAX) return false;
                 words[i] = leonida::rect_list_geometry(words[vs], why);
@@ -8406,6 +8520,7 @@ private:
         enum Kind : std::uint8_t { library, rect_list, depth_only } kind = library;
         std::uint8_t slot = 0;       // library: the create_graphics stage table entry (0 VS or MS, 1 GS, 2 PS)
         bool depth24 = false;        // library: the D24 fragment patch applies
+        bool rect_vertex = false;    // library VS: wrap with rect_list_vertex() (no geometryShader)
         const leonida::ShaderEntry* entry = nullptr;  // library: the translated shader
     };
 
@@ -8432,7 +8547,48 @@ private:
     std::vector<leonida::GraphicsShaderModules::Reference> modules_;
     leonida::GraphicsShaderModules::Reference rectangle_vertex_;
     VkShaderModule rectangle_module_ = VK_NULL_HANDLE;
-    bool rectangle_capable_ = false;  // graphics: a vertex stage the rectangle-list geometry stage can follow
+    static bool expand_rect_vertex_inputs(const std::vector<VkVertexInputBindingDescription>& in_bindings,
+                                          const std::vector<VkVertexInputAttributeDescription>& in_attrs,
+                                          const std::vector<std::uint32_t>& rect_in_locs,
+                                          std::vector<VkVertexInputBindingDescription>& out_bindings,
+                                          std::vector<VkVertexInputAttributeDescription>& out_attrs,
+                                          std::string& why) {
+        if (in_bindings.size() * 3 > 31) {
+            why = "too many vertex buffer bindings for 3-corner rectangle expansion";
+            return false;
+        }
+        for (const auto& b : in_bindings) {
+            if (b.inputRate != VK_VERTEX_INPUT_RATE_VERTEX) {
+                why = "per-instance vertex input is unsupported in rectangle-list vertex expansion";
+                return false;
+            }
+        }
+        out_bindings.clear();
+        out_bindings.reserve(in_bindings.size() * 3);
+        for (std::size_t bi = 0; bi < in_bindings.size(); ++bi) {
+            for (std::uint32_t k = 0; k < 3; ++k)
+                out_bindings.push_back({std::uint32_t(3 * bi + k), 0, VK_VERTEX_INPUT_RATE_INSTANCE});
+        }
+        out_attrs.clear();
+        out_attrs.reserve(in_attrs.size() * 3);
+        for (const auto& a : in_attrs) {
+            std::size_t loc_idx = SIZE_MAX;
+            for (std::size_t j = 0; j < rect_in_locs.size(); ++j)
+                if (rect_in_locs[j] == a.location) { loc_idx = j; break; }
+            if (loc_idx == SIZE_MAX) continue;
+            std::size_t bi = SIZE_MAX;
+            for (std::size_t b = 0; b < in_bindings.size(); ++b)
+                if (in_bindings[b].binding == a.binding) { bi = b; break; }
+            if (bi == SIZE_MAX) continue;
+            for (std::uint32_t k = 0; k < 3; ++k)
+                out_attrs.push_back({std::uint32_t(3 * loc_idx + k), std::uint32_t(3 * bi + k), a.format, a.offset});
+        }
+        return true;
+    }
+
+    bool rectangle_capable_ = false;     // graphics: a vertex stage that can expand rectangle lists
+    bool rectangle_via_vertex_ = false;  // graphics: expand in the vertex stage (no geometryShader) instead of GS
+    std::vector<std::uint32_t> rectangle_in_locs_;  // cached original Location inputs for !lazy_ rectangle_module_
     VkShaderModule shader_module(std::span<const std::uint32_t> words) {
         auto& vk=device_.context->vk;
         auto object = device_.graphics_modules.acquire(device_.info.device, vk.vkCreateShaderModule,

@@ -400,7 +400,8 @@ class UndefinedResult(Exception):
 
 
 def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_constants=None, memory=None,
-                  out_of_range="raise", return_outputs=False, lanes=None, resources=None, helpers=()):
+                  out_of_range="raise", return_outputs=False, lanes=None, resources=None, helpers=(),
+                  derivatives="fine"):
     """Execute `invocations` invocations of `text` in lockstep and return the shared `memory`.
 
     Invocation i is subgroup i // subgroup_size, lane i % subgroup_size (a 1-D workgroup split into subgroups in
@@ -434,9 +435,18 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
     `helpers` names invocations that run the shader but take no part in subgroup operations, as helper lanes a
     driver leaves out: their ballot bit is never set, they count for no vote or reduction, and a shuffle from their
     lane is undefined. They still receive each operation's result over the others.
+
+    Derivatives (OpDPdx, OpDPdy and their Fine and Coarse forms, fragment shaders): the quad of lane l is lanes
+    4 * (l // 4) .. 4 * (l // 4) + 3 of its subgroup, laid out as Vulkan's quads are, lane bit 0 the x step and bit 1
+    the y step. Helper invocations take part, as they exist for derivatives; a quad lane no invocation takes makes the
+    result undefined (UndefinedResult). Fine: the difference along this invocation's own row (x) or column (y);
+    Coarse: along the quad's first row or column, the same for all four. `derivatives` picks which one the plain
+    OpDPdx / OpDPdy are, as a driver may choose either.
     """
     if out_of_range not in ("raise", "wrap"):
         raise ValueError(f"out_of_range: {out_of_range!r}")
+    if derivatives not in ("fine", "coarse"):
+        raise ValueError(f"derivatives: {derivatives!r}")
     memory = {} if memory is None else memory
     workgroup = {}                             # Workgroup variable id -> its box, one per workgroup
     slots = list(range(invocations)) if lanes is None else list(lanes)
@@ -456,6 +466,21 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
             pending[i] = None
             invocation_outputs[i] = done.value
 
+    def quad_derivative(i, kind):
+        q = slots[i] // 4
+        quad = {slots[j] % 4: pending[j][2] for j in range(invocations) if slots[j] // 4 == q}
+        if len(quad) != 4:
+            raise UndefinedResult(f"invocation {i}: {kind} with {4 - len(quad)} of its quad's lanes not running")
+        lane = slots[i] % 4
+        coarse = kind.endswith("Coarse") or (kind in ("OpDPdx", "OpDPdy") and derivatives == "coarse")
+        if kind.startswith("OpDPdx"):
+            lo, hi = (0, 1) if coarse else (lane & 2, (lane & 2) | 1)
+        else:
+            lo, hi = (0, 2) if coarse else (lane & 1, (lane & 1) | 2)
+        a, b = quad[hi], quad[lo]
+        sub = lambda p, r: f32(ieee_nan(p - r, p, r))     # noqa: E731
+        return tuple(sub(p, r) for p, r in zip(a, b)) if isinstance(a, tuple) else sub(a, b)
+
     for i in range(invocations):
         advance(i, None)
     while True:
@@ -474,6 +499,9 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
         results = []
         for i in range(invocations):
             kind, _, _value, ident = pending[i]
+            if kind in DERIVATIVES:
+                results.append(quad_derivative(i, kind))
+                continue
             sub = slots[i] // subgroup_size
             group = {slots[j] % subgroup_size: pending[j] for j in range(invocations)
                      if slots[j] // subgroup_size == sub and j not in helpers}
@@ -508,6 +536,7 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
     return (memory, invocation_outputs) if return_outputs else memory
 
 
+DERIVATIVES = frozenset({"OpDPdx", "OpDPdy", "OpDPdxFine", "OpDPdyFine", "OpDPdxCoarse", "OpDPdyCoarse"})
 _TICK = ("tick", None, None, None)
 _PARSED = {}
 
@@ -1068,6 +1097,12 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             if types.t[a[0]][0] != "int" or val(a[1]) != 3:
                 raise UnsupportedConstruct("OpGroupNonUniformBroadcastFirst other than a Subgroup-scope integer")
             values[res] = yield (op, pc - 1, val(a[2]), None)
+        elif op in DERIVATIVES:
+            # <float or float vector> <P>: run_workgroup takes the difference over the quad (run_fragment refuses it,
+            # as it does a subgroup operation: one invocation has no neighbours).
+            if types.t[a[0]][0] not in ("float", "vec"):
+                raise UnsupportedConstruct(f"{op} of a non-float type")
+            values[res] = yield (op, pc - 1, val(a[1]), None)
         elif op == "OpGroupNonUniformShuffle":
             if types.t[a[0]][0] != "int" or val(a[1]) != 3:
                 raise UnsupportedConstruct("OpGroupNonUniformShuffle other than a Subgroup-scope integer")

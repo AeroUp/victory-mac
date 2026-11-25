@@ -69,7 +69,7 @@ if __name__ == "__main__" and sys.version_info < (3, 12):   # before code an old
 ROOT = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.join(ROOT, "tools")
 sys.path.insert(0, TOOLS)
-from mc_command import install_hint as mc_install_hint, mc_command  # noqa: E402
+from mc_command import homebrew_keg_bins, install_hint as mc_install_hint, mc_command  # noqa: E402
 import leonida_tui  # noqa: E402
 from shader_stage_manifest import shader_stems  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
@@ -973,6 +973,18 @@ def xwin_dir() -> "str | None":
 CROSS_SUFFIXES = ("", *(f"-{n}" for n in range(40, 18, -1)))
 
 
+def add_homebrew_llvm_to_path() -> list:
+    """macOS: append the bin folders of Homebrew's keg-only llvm and lld (and llvm@<N>, lld@<N>) to PATH, so
+    shutil.which, CMake and the tools this build starts find clang-cl, lld-link, llvm-lib, llvm-rc, llvm-mt and
+    llvm-mc. They go after every folder already there, so Apple's clang stays the compiler of the native builds
+    (vk_pipeline_check) and a tool the user put on PATH wins. Returns the folders added; nothing off macOS."""
+    have = [d for d in os.environ.get("PATH", "").split(os.pathsep) if d]
+    added = [d for d in homebrew_keg_bins("llvm", "lld") if d not in have]
+    if added:
+        os.environ["PATH"] = os.pathsep.join([*have, *added])
+    return added
+
+
 def cross_tool_suffix() -> "str | None":
     """"" for the plain LLVM tool names, "-N" for a set named like clang-cl-21: the first complete set whose
     clang-cl is 19 or newer, plain names first. None if there is none."""
@@ -1031,11 +1043,14 @@ def cross_build_missing() -> list:
             missing.append(f"clang-cl 19 or newer (this one is {major}; the MSVC STL from xwin rejects older Clang)")
         else:
             missing.append(f"{', '.join(absent)}: LLVM 19 or newer (clang, lld and llvm), all five by their plain "
-                           "names or with one version suffix such as clang-cl-21")
+                           "names or with one version suffix such as clang-cl-21"
+                           + ("; on macOS, brew install llvm lld (keg-only, found without further setup)"
+                              if sys.platform == "darwin" else ""))
     if not xwin_dir():
         missing.append("an xwin splat made with `xwin splat --use-winsysroot-style --preserve-ms-arch-notation` "
                        "(VC/Tools/MSVC and Windows Kits/10/Lib/<version>/um/x64) in XWIN_DIR or "
-                       "~/.local/share/xwin-sdk, see docs/testing.md, \"The Windows runtime on Linux\"")
+                       "~/.local/share/xwin-sdk, see docs/testing.md, \"The Windows runtime on Linux\""
+                       + (" and docs/macos.md" if sys.platform == "darwin" else ""))
     return missing
 
 
@@ -1775,7 +1790,7 @@ WAVE64_MODES = ("auto", "on", "off")
 FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
                   ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"),
-                  ("--compact-spirv", "compact_spirv"))
+                  ("--compact-spirv", "compact_spirv"), ("--vs-single-lane", "vs_single_lane"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
@@ -1901,6 +1916,16 @@ def runtime_gpu_per_vertex():
         v = json.loads(r.stdout.strip().splitlines()[-1]).get("per_vertex_inputs")
         return None if v is None else bool(v)
     except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
+
+
+def runtime_gpu_vertex_lane_index():
+    """vertex_lane_index as tools/vk_subgroup_info.py answers for the GPU the runtime would use: False where a vertex
+    shader can't read its subgroup lane (MoltenVK), None when it can't tell."""
+    try:
+        v = runtime_gpu_info().get("vertex_lane_index")
+        return v if isinstance(v, bool) else None
+    except (AttributeError, TypeError):
         return None
 
 
@@ -2450,6 +2475,26 @@ def wine_launcher(out: str, work: str, image: str) -> str:
     return f"""#!/bin/sh
 # Starts the Windows build of the loader with Wine. WINE picks another one, e.g. a Proton build's bin/wine.
 here=$(dirname "$(readlink -f "$0")")
+if [ "$(uname -s)" = Darwin ]; then
+    # WineHQ's macOS builds are app bundles that put nothing on PATH (docs/macos.md).
+    if [ -z "${{WINE:-}}" ] && ! command -v wine >/dev/null 2>&1; then
+        for apps in "$HOME/Applications" /Applications; do
+            for app in "Wine Stable" "Wine Staging" "Wine Devel"; do
+                if [ -x "$apps/$app.app/Contents/Resources/wine/bin/wine" ]; then
+                    WINE="$apps/$app.app/Contents/Resources/wine/bin/wine"
+                    break 2
+                fi
+            done
+        done
+    fi
+    # Rosetta 2 runs the game's AVX code but leaves AVX out of CPUID without this, and gta6rt's host check stops.
+    export ROSETTA_ADVERTISE_AVX="${{ROSETTA_ADVERTISE_AVX:-1}}"
+fi
+if ! command -v "${{WINE:-wine}}" >/dev/null 2>&1; then
+    printf 'No Wine found (%s). Install Wine, or set WINE to its wine program; docs/linux.md and docs/macos.md say how.\\n' \\
+        "${{WINE:-wine}}" >&2
+    exit 127
+fi
 if [ "$#" -eq 1 ] && {{ [ "$1" = --dry-run ] || [ "$1" = --init ] || [ "$1" = --run ]; }}; then
     game=$(cat "$here/game_path.txt" && printf .) || exit 1
     cd "${{game%.}}" || exit 1
@@ -2486,8 +2531,12 @@ def cross_configure() -> str:
     suffix = "" if configured_cross_tools() else cross_tool_suffix() or ""
     tools = [f"-DCMAKE_{var}={shutil.which(name + suffix) or name + suffix}" for var, name in CROSS_VARS.items()
              ] if suffix else []
+    # LEONIDA_SDL3_FETCH: without the GameInput shim the loader binds GameInputCreate to the host's GameInput.dll,
+    # and Wine's is a stub that fails it, so the retail boot stops there before its first command list (docs/gameinput.md;
+    # measured under Wine by several testers in the coordination issue). Hash-checked SDL3 source, fetched once.
     cmake_configure(build, "--toolchain", os.path.join(ROOT, "runtime", "cmake", "clang-cl-xwin.cmake"),
-                    f"-DXWIN_DIR={xwin}", *tools, hint="CMake's error above says what the cross-build lacks "
+                    f"-DXWIN_DIR={xwin}", "-DLEONIDA_SDL3_FETCH=ON", *tools,
+                    hint="CMake's error above says what the cross-build lacks "
                     "(docs/testing.md, \"The Windows runtime on Linux\"). Or pass --runtime-build, or drop "
                     "runtime from --stages (the default without it: check,shaders,assets,pipelines).")
     return build
@@ -3028,6 +3077,10 @@ def main() -> int:
     ap.add_argument("--f16-interp-fallback", action="store_true",
                     help="16-bit interpolation from decoded halves the vertex/mesh shader exports instead of "
                          "PerVertexKHR inputs; on by itself when the runtime's GPU can't use them (MoltenVK)")
+    ap.add_argument("--vs-single-lane", action="store_true",
+                    help="translate each vertex shader invocation as a wave with one running lane and no subgroup "
+                         "operation; on by itself when the runtime's GPU has no lane index in vertex shaders "
+                         "(MoltenVK)")
     ap.add_argument("--mesh-compute", action="store_true",
                     help="translate mesh shaders to compute shaders writing an output buffer, for devices "
                          "without VK_EXT_mesh_shader; on by itself on Intel's Windows Vulkan driver, whose mesh "
@@ -3045,6 +3098,7 @@ def main() -> int:
     a = ap.parse_args()
     if a.loop_limit is not None and not 0 <= a.loop_limit <= 0xffffffff:
         ap.error("--loop-limit must be in 0..4294967295")
+    add_homebrew_llvm_to_path()  # macOS: before anything looks for llvm-mc or the cross-build's tools
     stages = STAGES
     if a.stages is not None:
         stages = [s.strip() for s in a.stages.split(",") if s.strip()]
@@ -3122,6 +3176,14 @@ def main() -> int:
             a.f16_interp_fallback = True
         elif per_vertex is None:
             a.f16_interp_fallback = keep_recorded_fallback("--f16-interp-fallback", work)
+    if "shaders" in stages and not a.vs_single_lane:
+        lane = runtime_gpu_vertex_lane_index()
+        if lane is False:
+            log("shaders: the GPU the runtime would use has no subgroup lane index in vertex shaders (MoltenVK: Metal "
+                "vertex functions have none): translating with --vs-single-lane")
+            a.vs_single_lane = True
+        elif lane is None:
+            a.vs_single_lane = keep_recorded_fallback("--vs-single-lane", work)
     if "shaders" in stages:
         if a.bary_fallback:
             # Command-line precedence: --bary-fallback wins over LEONIDA_BARY_FALLBACK=0.

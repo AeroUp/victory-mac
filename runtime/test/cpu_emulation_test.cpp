@@ -195,6 +195,32 @@ void test_apply() {
               "clzero loop >64 MiB second batch completes with CF=0, ZF=1, SF=0");
         VirtualFree(large, 0, MEM_RELEASE);
     }
+    // ADCX/ADOX on the CONTEXT: only CF (ADCX) or OF (ADOX) changes; the decoder is cpu_emulation_adx_test's.
+    c.Rip = 0x2000;
+    c.Rax = ~0ull;
+    c.Rcx = 0;
+    c.EFlags = 0x246 | 1;  // CF set, ZF and PF too
+    check(ce::apply(dec({0x66, 0x48, 0x0F, 0x38, 0xF6, 0xC1}), &c), "apply adcx rax, rcx");
+    check(c.Rax == 0 && c.EFlags == (0x246 | 1) && c.Rip == 0x2006, "adcx: ~0 + 0 + CF carries out, other flags kept");
+    c.R9 = 41;
+    c.R8 = 1;
+    c.EFlags = 0x202 | 0x800;  // OF set
+    check(ce::apply(dec({0xF3, 0x4D, 0x0F, 0x38, 0xF6, 0xC8}), &c) && c.R9 == 43 && c.EFlags == 0x202,
+          "adox r9, r8 adds OF and clears it");
+    static uint64_t source = 0xFFFFFFFFFFFFFFF6ull;  // -10
+    c.Rax = 10;
+    c.Rcx = reinterpret_cast<uint64_t>(&source);
+    c.EFlags = 0x202;
+    check(ce::apply(dec({0x66, 0x48, 0x0F, 0x38, 0xF6, 0x01}), &c) && c.Rax == 0 && (c.EFlags & 1),
+          "adcx rax, [rcx] reads its source");
+    c.Rcx = 0x10;  // the null page: a read fault, reported the way the CPU raises it
+    const uint64_t at = c.Rip;
+    std::memset(&fault, 0, sizeof fault);
+    check(!ce::apply(dec({0x66, 0x48, 0x0F, 0x38, 0xF6, 0x01}), &c, &fault) && c.Rip == at && c.Rax == 0,
+          "adcx from an unreadable address is refused and changes nothing");
+    check(fault.ExceptionCode == STATUS_ACCESS_VIOLATION && fault.ExceptionInformation[0] == 0 &&
+              fault.ExceptionInformation[1] == 0x10,
+          "adcx from an unreadable address reports a read access violation there");
 }
 
 // ---- Running the real encodings ----
@@ -335,6 +361,28 @@ void test_live(const ce::Host& host) {
     check(run(wb, lines, &marker, &ex) && marker == 1, "clwb ran and execution continued after it");
     std::printf("clwb: %s\n", path(host.clwb));
 
+    // ADCX and ADOX from memory, with the flags set by POPFQ (Rosetta 2 hands a #UD handler stale CF and OF after most
+    // other instructions, docs/macos.md):
+    //   mov rax,[rcx]; push qword [rcx+16]; popfq; adcx rax,[rcx+8]; mov [rdx],rax; setc byte [rdx+8]; ret
+    Code adcx({0x48, 0x8B, 0x01, 0xFF, 0x71, 0x10, 0x9D, 0x66, 0x48, 0x0F, 0x38, 0xF6, 0x41, 0x08, 0x48, 0x89, 0x02,
+               0x0F, 0x92, 0x42, 0x08, 0xC3});
+    //   the same with adox and seto
+    Code adox({0x48, 0x8B, 0x01, 0xFF, 0x71, 0x10, 0x9D, 0xF3, 0x48, 0x0F, 0x38, 0xF6, 0x41, 0x08, 0x48, 0x89, 0x02,
+               0x0F, 0x90, 0x42, 0x08, 0xC3});
+    struct { uint64_t a, b; bool carry_in; } adx_cases[] = {{~0ull, 1, false}, {5, 7, false}, {~0ull, 0, true}, {5, 7, true}};
+    for (const auto& k : adx_cases) {
+        bool want_carry = false;
+        const uint64_t want = ce::add_with_carry(k.a, k.b, k.carry_in, true, &want_carry);
+        uint64_t args[3] = {k.a, k.b, 0x202 | (k.carry_in ? ce::kFlagCf : 0)}, res[2] = {};
+        check(run(adcx, args, res, &ex) && res[0] == want && (res[1] & 0xFF) == uint64_t(want_carry),
+              "adcx from memory takes CF");
+        args[2] = 0x202 | (k.carry_in ? ce::kFlagOf : 0) | ce::kFlagCf;  // CF set as well: ADOX must ignore it
+        res[0] = res[1] = 0;
+        check(run(adox, args, res, &ex) && res[0] == want && (res[1] & 0xFF) == uint64_t(want_carry),
+              "adox from memory takes OF");
+    }
+    std::printf("adcx/adox: %s\n", path(host.adx));
+
     // A #UD the handler does not know stays an illegal-instruction exception: ud2; ret
     Code ud({0x0F, 0x0B, 0xC3});
     check(!run(ud, nullptr, nullptr, &ex) && ex == STATUS_ILLEGAL_INSTRUCTION, "ud2 still faults");
@@ -346,8 +394,8 @@ int main() {
     test_bits();
     test_apply();
     const ce::Host host = ce::detect_host();
-    std::printf("host: SSE4a %d, MONITORX %d, CLZERO %d, CLWB %d\n", host.sse4a, host.monitorx, host.clzero,
-                host.clwb);
+    std::printf("host: SSE4a %d, MONITORX %d, CLZERO %d, CLWB %d, ADX %d\n", host.sse4a, host.monitorx, host.clzero,
+                host.clwb, host.adx);
     check(ce::install(), "install the handler");
     test_live(host);
     if (failures) {

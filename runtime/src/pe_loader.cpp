@@ -18,6 +18,7 @@
 
 #include "../shims/shims.h"
 #include "../shims/startup_trace.h"
+#include "adx_rewrite.h"
 #include "base_reservation.h"
 #include "clzero_patch.h"
 #include "cpu_emulation.h"
@@ -2201,6 +2202,39 @@ void Loader::protect_sections(Module& m) {
             std::fprintf(stderr,
                          "[rt] loader: %s: %zu CLZERO loops run from stubs at %p (%zu bytes), not as a #UD per line\n",
                          m.name.c_str(), patched.sites, static_cast<void*>(patched.stubs), patched.stub_bytes);
+    }
+    // On a CPU without ADX (Rosetta 2, Haswell), ADCX and ADOX run from stubs that keep the flags exact, instead of
+    // raising a #UD whose context Rosetta fills with stale flags (adx_rewrite.h, docs/macos.md). Same point: the
+    // sections are writable and none of the image's code has run. LEONIDA_ADX_REWRITE=0 leaves them to the #UD path.
+    static const bool adx_rewrite = rt::adx_rewrite::wanted();
+    if (adx_rewrite) {
+        std::vector<rt::adx_rewrite::Range> sections, functions;
+        const IMAGE_SECTION_HEADER* cs = IMAGE_FIRST_SECTION(nt);
+        for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++cs) {
+            if (!(cs->Characteristics & IMAGE_SCN_MEM_EXECUTE) || cs->VirtualAddress >= m.size) continue;
+            const uint64_t size = std::min<uint64_t>(std::min(cs->Misc.VirtualSize, cs->SizeOfRawData),
+                                                     m.size - cs->VirtualAddress);
+            if (size) sections.push_back({cs->VirtualAddress, static_cast<uint32_t>(cs->VirtualAddress + size)});
+        }
+        // .pdata BeginAddress values are known instruction starts; register_unwind() checks the table afterwards,
+        // and find_sites() drops a range outside the image.
+        const auto pdata = directory(nt, IMAGE_DIRECTORY_ENTRY_EXCEPTION);
+        if (pdata.Size && pdata.VirtualAddress < m.size) {
+            const uint64_t count = std::min<uint64_t>(pdata.Size, m.size - pdata.VirtualAddress) / sizeof(RUNTIME_FUNCTION);
+            const auto* f = at<RUNTIME_FUNCTION>(m.base, pdata.VirtualAddress);
+            functions.reserve(static_cast<size_t>(count));
+            for (uint64_t i = 0; i < count; ++i) functions.push_back({f[i].BeginAddress, f[i].EndAddress});
+        }
+        const auto r = rt::adx_rewrite::rewrite(m.base, m.size, sections, functions);
+        if (r.error)
+            std::fprintf(stderr, "[rt] loader: %s: ADCX/ADOX not rewritten (%s); they stay on the #UD path\n",
+                         m.name.c_str(), r.error);
+        else if (r.rewritten || r.refused || r.unsynced)
+            std::fprintf(stderr,
+                         "[rt] loader: %s: %zu ADCX/ADOX run from stubs at %p (%zu inside .pdata functions); %zu left "
+                         "to the #UD path (%zu forms a stub does not take, %zu right after data)\n",
+                         m.name.c_str(), r.rewritten, static_cast<void*>(r.stubs), r.in_functions,
+                         r.refused + r.unsynced, r.refused, r.unsynced);
     }
     VirtualProtect(m.base, nt->OptionalHeader.SizeOfHeaders, PAGE_READONLY, &old);
     auto* sec = IMAGE_FIRST_SECTION(nt);

@@ -2,7 +2,8 @@
 # Linux and macOS counterpart of Mods.bat: opens the mod manager window (tools/leonida_mods.py gui). It manages
 # <port>/mods and never touches the game package. The window needs Tkinter (Debian and Ubuntu: python3-tk).
 here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd) || exit 1
-for py in python3.14 python3.13 python3.12 python3 python; do
+for py in python3.19 python3.18 python3.17 python3.16 python3.15 python3.14 python3.13 python3.12 \
+          python3 python; do
     command -v "$py" >/dev/null 2>&1 || continue
     if "$py" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' >/dev/null 2>&1; then
         exec "$py" -I "$here/tools/leonida_mods.py" gui "$@"

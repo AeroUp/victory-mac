@@ -1,6 +1,6 @@
 # Linux
 
-What a Linux user (x86-64, a Vulkan GPU) can do today, from one page: the build of the shaders and assets runs
+What a Linux user (x86-64, a Vulkan GPU) can do today, from one page (the Mac page is [macos.md](macos.md)): the build of the shaders and assets runs
 natively, the Vulkan test tools build natively with GCC or Clang, and the loader (`gta6rt`) is a Windows program that
 runs under Wine or Proton. Nothing is playable on any platform yet (README, *Project status*).
 

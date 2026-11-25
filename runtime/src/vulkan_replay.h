@@ -829,6 +829,13 @@ struct GraphicsPipeline {
     static constexpr std::uint32_t rectangle_stage = 1u << 9;
     // IA topology requiring a fourth-corner geometry stage. Zero when the PSO already contains the stage.
     std::uint32_t rectangle_variant_topology = 0;
+    // True when rectangle-list expansion is compiled into the vertex shader instead of a geometry stage
+    // (devices without geometryShader, e.g. MoltenVK): emit draws 6 vertices per 3-vertex rectangle.
+    bool rectangle_expand_in_vs = false;
+    // True when rectangle_expand_in_vs also uses 3x instanced hardware vertex bindings for per-vertex Location
+    // inputs (`rect_vertex_slots[b_idx]` is bound to Vulkan bindings `3 * b_idx + 0..2` with stride `3 * stride`).
+    bool rectangle_instanced_inputs = false;
+    std::vector<std::uint32_t> rect_vertex_slots;
     std::function<VkPipeline(std::uint32_t flags)> variant;
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
     bool async_build = false;
@@ -2463,7 +2470,12 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     if (pipeline->depth_format != VK_FORMAT_UNDEFINED && !p.depth.id) unbound |= GraphicsPipeline::unbound_depth;
     if (unbound || !p.pipeline) {
         p.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
-        if (!p.pipeline && pipeline->async_build && !strict_replay()) {
+        // Not built yet (async_build), or not buildable on this device (a stage its driver cannot convert, such as
+        // a MoltenVK vertex shader, or a rectangle list without geometry shaders; the build logs why once): the draw
+        // is dropped, as one with an unresolvable resource is, and the rest of the list still runs. Failing the list
+        // instead dropped every submission that held one such draw (2,922 of about 2,925 in a boot on MoltenVK,
+        // docs/macos.md). LEONIDA_STRICT_REPLAY=1 restores the failure.
+        if (!p.pipeline && !strict_replay()) {
             p.skipped = true;
             return ReplayResult::success;
         }
@@ -2507,6 +2519,16 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     // A non-indexed quad list is drawn from the shared triangle index buffer (emit).
     if (!draw.indexed && !draw.mesh && draw.topology == topology_quad_list && !vk.quad_indices)
         return unresolved_at(__LINE__);
+    if (draw.indexed && !draw.mesh && draw.topology == topology_rect_list && pipeline->rectangle_expand_in_vs) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[rt] replay: indexed rectangle-list draw is unsupported without geometryShader\n");
+        if (!strict_replay()) {
+            p.skipped = true;
+            return ReplayResult::success;
+        }
+        return unsupported_at(__LINE__);
+    }
     if (draw.indexed) {
         if (draw.index.format == 57) p.index_type = VK_INDEX_TYPE_UINT16;
         else if (draw.index.format == 42) p.index_type = VK_INDEX_TYPE_UINT32;
@@ -4887,10 +4909,40 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
             vk.set_blend_constants(command_buffer, draw->blend_factor.data());
-            for (std::uint32_t slot = 0; slot < d.vertex_buffers.size(); ++slot) {
-                if (!d.vertex_buffers[slot]) continue;
-                vk.bind_vertex_buffers2(command_buffer, slot, 1, &d.vertex_buffers[slot], &d.vertex_offsets[slot],
-                                        &d.vertex_sizes[slot], &d.vertex_strides[slot]);
+            const bool rect_instanced = !draw->mesh && !draw->indexed && draw->topology == topology_rect_list &&
+                                        graphics.rectangle_expand_in_vs && graphics.rectangle_instanced_inputs;
+            if (rect_instanced) {
+                for (std::size_t bi = 0; bi < graphics.rect_vertex_slots.size(); ++bi) {
+                    const std::uint32_t slot = graphics.rect_vertex_slots[bi];
+                    if (slot >= d.vertex_buffers.size() || !d.vertex_buffers[slot]) continue;
+                    const VkBuffer buf = d.vertex_buffers[slot];
+                    const VkDeviceSize off = d.vertex_offsets[slot];
+                    const VkDeviceSize sz = d.vertex_sizes[slot];
+                    const VkDeviceSize st = d.vertex_strides[slot];
+                    for (std::uint32_t k = 0; k < 3; ++k) {
+                        VkDeviceSize k_off = off;
+                        VkDeviceSize k_sz = sz;
+                        VkDeviceSize k_stride = st ? (3 * st) : 0;
+                        if (st) {
+                            const VkDeviceSize adv = (VkDeviceSize(draw->first) + k) * st;
+                            if (sz != VK_WHOLE_SIZE && adv >= sz) {
+                                k_off = off + sz;
+                                k_sz = 0;
+                            } else {
+                                k_off = off + adv;
+                                k_sz = (sz == VK_WHOLE_SIZE) ? VK_WHOLE_SIZE : (sz - adv);
+                            }
+                        }
+                        vk.bind_vertex_buffers2(command_buffer, std::uint32_t(3 * bi + k), 1, &buf, &k_off, &k_sz,
+                                                &k_stride);
+                    }
+                }
+            } else {
+                for (std::uint32_t slot = 0; slot < d.vertex_buffers.size(); ++slot) {
+                    if (!d.vertex_buffers[slot]) continue;
+                    vk.bind_vertex_buffers2(command_buffer, slot, 1, &d.vertex_buffers[slot], &d.vertex_offsets[slot],
+                                            &d.vertex_sizes[slot], &d.vertex_strides[slot]);
+                }
             }
             if (draw->mesh) {
                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
@@ -4920,6 +4972,16 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                         vk.bind_index_buffer(command_buffer, vk.quad_indices, vk.quad_indices_offset, VK_INDEX_TYPE_UINT32);
                         vk.draw_indexed(command_buffer, quads * indices_per_quad, draw->instances, 0,
                                         std::int32_t(draw->first), draw->first_instance);
+                    }
+                }
+            } else if (draw->topology == topology_rect_list && graphics.rectangle_expand_in_vs) {
+                const std::uint32_t rects = draw->count / 3;
+                if (rects) {
+                    if (graphics.rectangle_instanced_inputs) {
+                        for (std::uint32_t inst = 0; inst < draw->instances; ++inst)
+                            vk.draw(command_buffer, 6, rects, draw->first, 0);
+                    } else {
+                        vk.draw(command_buffer, rects * 6, draw->instances, draw->first, draw->first_instance);
                     }
                 }
             } else if (draw->indexed) {

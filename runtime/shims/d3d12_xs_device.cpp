@@ -1509,9 +1509,68 @@ struct PresentState {
         // The fallback window belongs to its own thread (fallback_window_thread): that thread destroys it.
         if (window) PostMessageW(window, WM_APP + 1, 0, 0);
     }
-    HWND window = nullptr;  // the runtime's own fallback window, when the title has no window to present in
+    HWND window = nullptr;        // the runtime's own fallback window, when the title has no window to present in
+    HWND title_hwnd = nullptr;    // whichever top-level window PresentX renders into (title's or fallback)
+    std::wstring base_title;      // original window title preserved before appending FPS / frame pacing
+    bool base_title_read = false;
+    std::chrono::steady_clock::time_point fps_window_start{};
+    std::uint64_t fps_window_frames = 0;
     std::unique_ptr<rt::d3d12::XboxPresentation> xbox;
 };
+
+void update_window_fps_title(PresentState& state, HRESULT present_hr) {
+    if (FAILED(present_hr) || !state.title_hwnd) return;
+    static const bool enabled = [] {
+        const char* v = std::getenv("LEONIDA_TITLE_FPS");
+        return !(v && *v == '0');
+    }();
+    if (!enabled) return;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (state.fps_window_frames == 0 && state.fps_window_start == std::chrono::steady_clock::time_point{}) {
+        state.fps_window_start = now;
+    }
+    ++state.fps_window_frames;
+    const auto elapsed_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(now - state.fps_window_start).count();
+    if (elapsed_us < 500000) return;
+
+    if (!state.base_title_read) {
+        state.base_title_read = true;
+        wchar_t orig[256]{};
+        DWORD_PTR copied = 0;
+        if (SendMessageTimeoutW(state.title_hwnd, WM_GETTEXT, std::size(orig), reinterpret_cast<LPARAM>(orig),
+                                SMTO_ABORTIFHUNG, 10, &copied) &&
+            orig[0] != L'\0') {
+            state.base_title = orig;
+        } else {
+            state.base_title = L"Leonida";
+        }
+    }
+
+    const double fps = elapsed_us > 0 ? (double(state.fps_window_frames) * 1e6 / double(elapsed_us)) : 0.0;
+    const double ms = fps > 0.0 ? (1000.0 / fps) : 0.0;
+    state.fps_window_start = now;
+    state.fps_window_frames = 0;
+
+    const leonida::FramePacingSummary s = state.xbox->pacing_summary();
+    wchar_t stats[160]{};
+    if (s.samples > 0 && s.target_interval_us > 0) {
+        std::swprintf(stats, std::size(stats),
+                      L" | %.1f fps | %.1f ms (p50 %.1f / p95 %.1f ms, target %.1f ms)",
+                      fps, ms, double(s.p50_us) / 1000.0, double(s.p95_us) / 1000.0,
+                      double(s.target_interval_us) / 1000.0);
+    } else if (s.samples > 0) {
+        std::swprintf(stats, std::size(stats),
+                      L" | %.1f fps | %.1f ms (p50 %.1f / p95 %.1f ms)",
+                      fps, ms, double(s.p50_us) / 1000.0, double(s.p95_us) / 1000.0);
+    } else {
+        std::swprintf(stats, std::size(stats), L" | %.1f fps | %.1f ms", fps, ms);
+    }
+    const std::wstring full = state.base_title + stats;
+    SendMessageTimeoutW(state.title_hwnd, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(full.c_str()),
+                        SMTO_ABORTIFHUNG, 5, nullptr);
+}
 
 void destroy_present_state(void* present_state) {
     delete static_cast<PresentState*>(present_state);
@@ -1647,6 +1706,7 @@ PresentState* present_state_for(DeviceProxy* device, bool splash_only = false) {
         if (!target) return state;
         GetClientRect(target, &client);
     }
+    if (!hidden) state->title_hwnd = target;
     // No device reference for this presenter: the device's outer identity is this proxy, which owns the state, so
     // a reference would be a cycle and the proxy, the presenter and the window would never go. The proxy destroys
     // the state before it releases its device (proxy_release).
@@ -1700,10 +1760,12 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
                               std::uint64_t params) {
     PresentState* state = self->device ? present_state_for(self->device) : nullptr;
     if (!state || !state->xbox) return hr_to_u64(S_OK);  // a title still runs with nothing presented
-    return hr_to_u64(state->xbox->PresentX(
+    const HRESULT hr = state->xbox->PresentX(
         static_cast<UINT>(plane_count),
         reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(planes),
-        reinterpret_cast<const rt::d3d12::XboxPresentParameters*>(params)));
+        reinterpret_cast<const rt::d3d12::XboxPresentParameters*>(params));
+    update_window_fps_title(*state, hr);
+    return hr_to_u64(hr);
 }
 
 #else  // !LEONIDA_VULKAN_DEVICE: this translation unit stands alone (mock and COM tests)

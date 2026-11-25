@@ -4,7 +4,10 @@ With a filter that matches no device, a tool must not choose another GPU. It nam
 the other harnesses do (runtime/test/vk_device_pick.h, docs/testing.md "Choosing the GPU"). Before, both tools
 ignored the filter and ran on the best-ranked GPU.
 
-    python -I check_device_filter_tools.py <vk_descriptor_bench> <vk_sandbox> <work dir>
+    python -I check_device_filter_tools.py <vk_descriptor_bench> <vk_sandbox> <work dir> [--runner wine ...]
+
+--runner, once per word, is the command that starts a Windows executable on this host: Wine for a cross build. Linux
+can start a .exe through Wine's binfmt_misc entry, macOS cannot ("Exec format error"), so CMake passes its emulator.
 
 Exit 0 when both tools refuse the filter, 1 when one does not or when the device list fails for another reason, and
 77 (skip) on a machine with no Vulkan loader, driver or device, where no tool can choose one. Standard library only.
@@ -17,10 +20,11 @@ import sys
 
 FILTER = "leonida-no-such-gpu"
 UNSUPPORTED = 77
+RUNNER = []  # the command that runs a Windows executable here: empty on Windows, Wine for a cross build
 
 
 def run(cmd, env=None):
-    p = subprocess.run(cmd, capture_output=True, text=True, errors="replace", env=env, timeout=120)
+    p = subprocess.run([*RUNNER, *cmd], capture_output=True, text=True, errors="replace", env=env, timeout=120)
     return p.returncode, p.stdout + p.stderr
 
 
@@ -38,10 +42,17 @@ def no_vulkan(code, out):
 
 
 def main(argv):
-    if len(argv) != 4:
+    args, runner = [], []
+    for a in argv[1:]:
+        if a.startswith("--runner="):
+            runner.append(a[len("--runner="):])
+        else:
+            args.append(a)
+    if len(args) != 3:
         print(__doc__, file=sys.stderr)
         return 2
-    bench, sandbox, work = argv[1:]
+    RUNNER[:] = runner
+    bench, sandbox, work = args
     os.makedirs(work, exist_ok=True)
 
     # The device list ignores the filter, so it shows whether there is any device to choose from.
@@ -67,7 +78,10 @@ def main(argv):
                       ("vk_sandbox", [sandbox, scene, missing, missing, "--out", os.path.join(work, "out.ppm")])):
         code, out = run(cmd, env=env)
         named = f"LEONIDA_VK_DEVICE={FILTER}" in out
-        if code == 0 or not named or "device:" in out:
+        # A chosen device is the tool's own "device: <name>" line. Only at a line start: MoltenVK logs
+        # "[mvk-info] GPU device:" for every device it enumerates (under Wine on a Mac it logs to stderr).
+        chose = re.search(r"^device:", out, re.M) is not None
+        if code == 0 or not named or chose:
             failures.append(f"{name}: exit {code}, {'names' if named else 'does not name'} the filter:\n{out.strip()}")
         else:
             print(f"ok: {name} refuses LEONIDA_VK_DEVICE={FILTER} (exit {code})")
