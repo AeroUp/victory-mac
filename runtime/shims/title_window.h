@@ -15,8 +15,13 @@
 // GetWindow(GW_OWNER), GetWindowLongPtrW and GetClientRect read the window manager's own state and send nothing.
 
 #include <windows.h>
+#include <atomic>
 
 namespace rt::d3d12 {
+
+// Shared between gameinput (Ctrl mouse-lock toggle) and the window title ticker.
+inline std::atomic<bool> g_mouse_control_active{false};
+inline std::atomic<bool> g_mouse_unlocked{false};
 
 // The visible, unowned, non-tool top-level window of `process_id` with the largest client area, `exclude` aside (the
 // runtime's own fallback window); null when the process has none. Ties keep the first one in Z order (the topmost).

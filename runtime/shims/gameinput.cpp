@@ -32,6 +32,7 @@
 // ASSUMPTION: the console executable is not available, so the DLL it imports GameInputCreate from is unknown. The PC
 // API lives in gameinput.dll; on console the GDK links it through xgameruntime. Both names are registered.
 #include <windows.h>
+#include "title_window.h"
 
 #include <SDL3/SDL.h>
 
@@ -1783,6 +1784,7 @@ struct KeyboardPad {
     int right_x = 0, right_y = 0;    // the mouse's right stick, SDL axis units (+Y down)
     int cursor_x = 0, cursor_y = 0;  // the cursor at the last poll
     bool have_cursor = false;        // cursor_x/y are valid; false after focus loss, so the first poll moves nothing
+    bool prev_ctrl_down = false;     // edge-trigger for Ctrl mouse-lock toggle
 };
 KeyboardPad g_keyboard;
 
@@ -1841,7 +1843,8 @@ bool attach_keyboard_pad() {
     }
     std::fprintf(stderr, "[rt] gameinput: keyboard pad attached (arrows d-pad, Enter A, Backspace B, X X, Y Y, "
                          "Q/E shoulders, Esc Menu, Tab View, WASD left stick, mouse right stick, right/left "
-                         "button LT/RT)\n");
+                         "button LT/RT, Ctrl toggle mouse lock)\n");
+    rt::d3d12::g_mouse_control_active.store(true, std::memory_order_relaxed);
     start_raw_mouse();
     return true;
 }
@@ -1856,6 +1859,7 @@ void update_keyboard_pad() {
         sens = g().config.mouse_sensitivity;
     }
     if (mode == rt::gameinput::KeyboardPadMode::Off) {
+        rt::d3d12::g_mouse_control_active.store(false, std::memory_order_relaxed);
         clip_cursor(false);
         if (g_keyboard.id) detach_keyboard_pad();
         g_keyboard.failed = false;
@@ -1869,31 +1873,48 @@ void update_keyboard_pad() {
     // Focus gates physical keyboard and mouse input. Read the cursor afresh on return to avoid a jump.
     // Scripted presses still run while the window is unfocused.
     const bool active = mode == rt::gameinput::KeyboardPadMode::Always || g_has_focus.load()();
+    bool mouse_unlocked = rt::d3d12::g_mouse_unlocked.load(std::memory_order_relaxed);
     if (active) {
         const rt::gameinput::KeyDownFn key_down = g_key_down.load();
+        const bool ctrl_down = key_down(VK_CONTROL);
+        if (ctrl_down && !g_keyboard.prev_ctrl_down) {
+            mouse_unlocked = !mouse_unlocked;
+            rt::d3d12::g_mouse_unlocked.store(mouse_unlocked, std::memory_order_relaxed);
+            std::fprintf(stderr, "[rt] gameinput: %s\n",
+                         mouse_unlocked ? "mouse unlocked (press Ctrl to lock)"
+                                        : "mouse locked (press Ctrl to unlock)");
+        }
+        g_keyboard.prev_ctrl_down = ctrl_down;
         for (const auto& b : kKeyBindings) down[b.sdl_button] |= key_down(b.virtual_key);
         lx = key_down('D') - key_down('A');  // opposite keys cancel
         ly = key_down('S') - key_down('W');  // SDL's +Y is down
-        aim = key_down(VK_RBUTTON);
-        fire = key_down(VK_LBUTTON);
+        if (!mouse_unlocked) {
+            aim = key_down(VK_RBUTTON);
+            fire = key_down(VK_LBUTTON);
 
-        int x = 0, y = 0;
-        const bool have = g_cursor_pos.load()(&x, &y);
-        const bool moved = have && g_keyboard.have_cursor;
-        auto step = [sens](int v, int pixels) {
-            const long long n = static_cast<long long>(v) * kMouseDecayNum / kMouseDecayDen +
-                                std::lround(static_cast<long long>(pixels) * kMouseAxisPerPixel * sens);
-            return static_cast<int>(std::clamp<long long>(n, -kStickFull, kStickFull));
-        };
-        g_keyboard.right_x = step(g_keyboard.right_x, moved ? x - g_keyboard.cursor_x : 0);
-        g_keyboard.right_y = step(g_keyboard.right_y, moved ? y - g_keyboard.cursor_y : 0);
-        if (have) g_keyboard.cursor_x = x, g_keyboard.cursor_y = y;
-        g_keyboard.have_cursor = have;
+            int x = 0, y = 0;
+            const bool have = g_cursor_pos.load()(&x, &y);
+            const bool moved = have && g_keyboard.have_cursor;
+            auto step = [sens](int v, int pixels) {
+                const long long n = static_cast<long long>(v) * kMouseDecayNum / kMouseDecayDen +
+                                    std::lround(static_cast<long long>(pixels) * kMouseAxisPerPixel * sens);
+                return static_cast<int>(std::clamp<long long>(n, -kStickFull, kStickFull));
+            };
+            g_keyboard.right_x = step(g_keyboard.right_x, moved ? x - g_keyboard.cursor_x : 0);
+            g_keyboard.right_y = step(g_keyboard.right_y, moved ? y - g_keyboard.cursor_y : 0);
+            if (have) g_keyboard.cursor_x = x, g_keyboard.cursor_y = y;
+            g_keyboard.have_cursor = have;
+        } else {
+            g_keyboard.right_x = g_keyboard.right_y = 0;
+            g_keyboard.have_cursor = false;
+        }
     } else {
+        g_keyboard.prev_ctrl_down = false;
         g_keyboard.right_x = g_keyboard.right_y = 0;
         g_keyboard.have_cursor = false;
     }
-    clip_cursor(active && g_raw_ready && g_cursor_pos.load() == system_cursor_pos && foreground_is_ours());
+    clip_cursor(active && !mouse_unlocked && g_raw_ready && g_cursor_pos.load() == system_cursor_pos &&
+                foreground_is_ours());
     for (const auto& b : kKeyBindings) SDL_SetJoystickVirtualButton(g_keyboard.js, b.sdl_button, down[b.sdl_button]);
     // LEONIDA_INPUT_SCRIPT="a@70,a@85,start@120" (with LEONIDA_KEYBOARD_PAD=always): timed presses on the keyboard
     // pad, in seconds since the pad's first update, each held 300 ms. For unattended boots: the title's first prompt

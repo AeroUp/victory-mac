@@ -1537,34 +1537,29 @@ struct PresentState {
     std::unique_ptr<rt::d3d12::XboxPresentation> xbox;
 };
 
-void format_and_set_window_title(PresentState& state, std::chrono::steady_clock::time_point now) {
-    if (!state.title_hwnd) return;
+std::wstring build_window_title_locked(PresentState& state, std::chrono::steady_clock::time_point now) {
     if (!state.base_title_read) {
         state.base_title_read = true;
-        wchar_t orig[256]{};
-        DWORD_PTR copied = 0;
-        if (SendMessageTimeoutW(state.title_hwnd, WM_GETTEXT, std::size(orig), reinterpret_cast<LPARAM>(orig),
-                                SMTO_ABORTIFHUNG, 10, &copied) &&
-            orig[0] != L'\0') {
-            state.base_title = orig;
-        } else {
-            state.base_title = L"Americas";
-        }
+        state.base_title = L"Americas";
     }
     const auto ago_s = state.last_present != std::chrono::steady_clock::time_point{}
                            ? std::chrono::duration_cast<std::chrono::seconds>(now - state.last_present).count()
                            : 0;
     const double display_fps = ago_s >= 2 ? 0.0 : state.last_fps;
-    wchar_t stats[192]{};
+    const wchar_t* mouse_hint = L"";
+    if (rt::d3d12::g_mouse_control_active.load(std::memory_order_relaxed)) {
+        mouse_hint = rt::d3d12::g_mouse_unlocked.load(std::memory_order_relaxed)
+                         ? L" | Mouse unlocked (Ctrl: lock)"
+                         : L" | Ctrl: unlock mouse";
+    }
+    wchar_t stats[256]{};
     std::swprintf(stats, std::size(stats),
-                  L" | VIctory %.0f fps %.1f ms/frame %llu draws/frame | frame %llu %llds ago",
+                  L" | VIctory %.0f fps %.1f ms/frame %llu draws/frame | frame %llu %llds ago%ls",
                   display_fps, state.last_ms,
                   static_cast<unsigned long long>(state.last_draws_per_frame),
                   static_cast<unsigned long long>(state.total_frames),
-                  static_cast<long long>(ago_s));
-    const std::wstring full = state.base_title + stats;
-    SendMessageTimeoutW(state.title_hwnd, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(full.c_str()),
-                        SMTO_ABORTIFHUNG, 5, nullptr);
+                  static_cast<long long>(ago_s), mouse_hint);
+    return state.base_title + stats;
 }
 
 void update_window_fps_title(PresentState& state, HRESULT present_hr) {
@@ -1608,26 +1603,43 @@ void update_window_fps_title(PresentState& state, HRESULT present_hr) {
         state.fps_window_draws = 0;
     }
 
-    const auto since_update_us =
-        state.last_title_update == std::chrono::steady_clock::time_point{}
-            ? 500000LL
-            : std::chrono::duration_cast<std::chrono::microseconds>(now - state.last_title_update).count();
-    if (since_update_us >= 250000 || state.total_frames == 1) {
-        state.last_title_update = now;
-        format_and_set_window_title(state, now);
-    }
-
     if (!state.ticker.joinable()) {
         state.ticker = std::thread([&state] {
+            bool read_orig = false;
+            std::wstring last_sent;
             while (!state.ticker_stop.load(std::memory_order_acquire)) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                if (state.ticker_stop.load(std::memory_order_acquire)) break;
-                std::lock_guard tick_lock(state.title_mutex);
-                const auto tick_now = std::chrono::steady_clock::now();
-                if (state.last_present != std::chrono::steady_clock::time_point{} &&
-                    std::chrono::duration_cast<std::chrono::seconds>(tick_now - state.last_present).count() >= 1) {
-                    format_and_set_window_title(state, tick_now);
+                HWND hwnd = nullptr;
+                {
+                    std::lock_guard tick_lock(state.title_mutex);
+                    hwnd = state.title_hwnd;
                 }
+                if (hwnd && !read_orig) {
+                    read_orig = true;
+                    wchar_t orig[256]{};
+                    DWORD_PTR copied = 0;
+                    if (SendMessageTimeoutW(hwnd, WM_GETTEXT, std::size(orig), reinterpret_cast<LPARAM>(orig),
+                                            SMTO_NORMAL, 250, &copied) &&
+                        orig[0] != L'\0') {
+                        std::lock_guard tick_lock(state.title_mutex);
+                        state.base_title = orig;
+                        state.base_title_read = true;
+                    }
+                }
+                if (hwnd) {
+                    std::wstring full;
+                    {
+                        std::lock_guard tick_lock(state.title_mutex);
+                        full = build_window_title_locked(state, std::chrono::steady_clock::now());
+                    }
+                    if (full != last_sent) {
+                        if (SendMessageTimeoutW(hwnd, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(full.c_str()),
+                                                SMTO_NORMAL, 250, nullptr)) {
+                            last_sent = std::move(full);
+                        }
+                    }
+                }
+                for (int i = 0; i < 5 && !state.ticker_stop.load(std::memory_order_acquire); ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
         });
     }
