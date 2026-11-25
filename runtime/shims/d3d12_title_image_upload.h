@@ -61,7 +61,8 @@ public:
         const bool need_idle = !consumers_.empty();
         const auto result = d.context->write_staged_title_batch(
             need_idle,
-            [&](const leonida::ReplayFunctions& replay, auto&& get_pieces, auto&& mark_general) -> VkResult {
+            [&](const leonida::ReplayFunctions& replay, auto&& get_pieces, auto&& mark_general,
+                const auto& waits) -> VkResult {
                 auto& vk = d.context->vk;
                 VkResult r = vk.vkResetCommandBuffer(s.command, 0);
                 if (r != VK_SUCCESS) return r;
@@ -87,7 +88,7 @@ public:
                             VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
                 }
                 if ((r = vk.vkEndCommandBuffer(s.command)) != VK_SUCCESS) return r;
-                r = submit_slot(d, s, /*wait_now=*/false);
+                r = submit_slot(d, s, /*wait_now=*/false, waits);
                 if (r == VK_SUCCESS) {
                     for (std::size_t i = 0; i < batch_items_.size(); ++i)
                         if (!all_pieces[i].empty()) mark_general(batch_items_[i].id, all_pieces[i]);
@@ -188,7 +189,8 @@ public:
 
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, layers};
         const auto result = d.context->write_staged_title_image(id, range, [&](const leonida::ReplayFunctions& replay,
-                                                                               const leonida::LayoutPieces& pieces) {
+                                                                               const leonida::LayoutPieces& pieces,
+                                                                               const auto& waits) {
             auto& vk = d.context->vk;
             VkResult r = vk.vkResetCommandBuffer(s.command, 0);
             if (r != VK_SUCCESS) return r;
@@ -206,7 +208,11 @@ public:
                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                     VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
             if ((r = vk.vkEndCommandBuffer(s.command)) != VK_SUCCESS) return r;
-            return submit_slot(d, s, /*wait_now=*/true);
+            // Waits for its copy under the default sync (VulkanContext::title_upload_sync). Otherwise later
+            // submissions on this queue run after it and the other queues wait for it on the GPU (submit_slot), as
+            // the batched refresh does, and the ring slot is waited for before reuse.
+            const bool wait_now = leonida::VulkanContext::title_upload_sync() == leonida::VulkanContext::TitleUploadSync::idle;
+            return submit_slot(d, s, wait_now, waits);
         });
         if (result == VK_SUCCESS) ring_index_ = (ring_index_ + 1) % kRing;
         return result == VK_SUCCESS;
@@ -236,6 +242,7 @@ private:
     template<class Device>
     bool wait_slot(Device& d, Slot& s) {
         if (!s.pending_value || !ready_) return true;
+        const leonida::frame_profile::Scope timed(leonida::frame_profile::upload_slot);
         auto& vk = d.context->vk;
         VkSemaphoreWaitInfo done{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
         done.semaphoreCount = 1;
@@ -294,14 +301,28 @@ private:
         return true;
     }
 
-    template<class Device>
-    VkResult submit_slot(Device& d, Slot& s, bool wait_now) {
+    template<class Device, class Waits>
+    VkResult submit_slot(Device& d, Slot& s, bool wait_now, const Waits& waits) {
         auto& vk = d.context->vk;
         ++value_;
+        // The submissions that may still read the image (VulkanContext::title_upload_waits_locked), waited for here
+        // on the GPU.
+        std::vector<VkSemaphore> wait_semaphores;
+        std::vector<std::uint64_t> wait_values;
+        for (const auto& [semaphore, value] : waits) {
+            wait_semaphores.push_back(semaphore);
+            wait_values.push_back(value);
+        }
+        const std::vector<VkPipelineStageFlags> wait_stages(wait_semaphores.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        timeline.waitSemaphoreValueCount = std::uint32_t(wait_values.size());
+        timeline.pWaitSemaphoreValues = wait_values.data();
         timeline.signalSemaphoreValueCount = 1;
         timeline.pSignalSemaphoreValues = &value_;
         VkSubmitInfo transfer{VK_STRUCTURE_TYPE_SUBMIT_INFO, &timeline};
+        transfer.waitSemaphoreCount = std::uint32_t(wait_semaphores.size());
+        transfer.pWaitSemaphores = wait_semaphores.data();
+        transfer.pWaitDstStageMask = wait_stages.data();
         transfer.commandBufferCount = 1;
         transfer.pCommandBuffers = &s.command;
         transfer.signalSemaphoreCount = 1;

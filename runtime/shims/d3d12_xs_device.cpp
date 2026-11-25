@@ -39,6 +39,7 @@ std::uint64_t take_submitted_draws(ID3D12Device* device);
 #include "d3d12_xs_alloc_size.h"
 #include "d3d12_xs_desc_clean.h"
 #include "../src/frame_pacer.h"
+#include "../src/frame_profile.h"
 #include "../src/local_diagnostics.h"
 #include "d3d12_xs_pso_stream.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
@@ -1511,6 +1512,11 @@ std::atomic<std::uint64_t> g_fps_ecl_us{0};
 std::atomic<std::uint64_t> g_fps_ecl_calls{0};
 std::atomic<std::uint64_t> g_fps_present_us{0};
 std::atomic<std::uint64_t> g_fps_wait_us{0};
+// The same three, taken every frame by the slow-frame log (LEONIDA_HITCH_MS).
+std::atomic<std::uint64_t> g_frame_ecl_us{0};
+std::atomic<std::uint64_t> g_frame_ecl_calls{0};
+std::atomic<std::uint64_t> g_frame_present_us{0};
+std::atomic<std::uint64_t> g_frame_wait_us{0};
 
 struct PresentState {
     ~PresentState() {
@@ -1572,6 +1578,36 @@ std::wstring build_window_title_locked(PresentState& state, std::chrono::steady_
     return state.base_title + stats;
 }
 
+// LEONIDA_HITCH_MS=<n>: one line for each frame that took at least n ms from the last PresentX to this one, with
+// what the runtime spent of it: in ExecuteCommandLists (and inside that, waiting for the GPU to make room, copying
+// shadow buffers, geometry windows and CPU-written textures), in PresentX and in WaitFrameEventX. What is left is
+// the title's own time. The per-frame counters are taken every frame, logged or not.
+void log_slow_frame(PresentState& state, double frame_dt_ms) {
+    namespace fp = leonida::frame_profile;
+    static const double threshold_ms = [] {
+        const char* v = std::getenv("LEONIDA_HITCH_MS");
+        return v && *v ? std::atof(v) : 0.0;
+    }();
+    if (threshold_ms <= 0.0) return;
+    const double ecl = double(g_frame_ecl_us.exchange(0, std::memory_order_relaxed)) / 1000.0;
+    const auto calls = g_frame_ecl_calls.exchange(0, std::memory_order_relaxed);
+    const double present = double(g_frame_present_us.exchange(0, std::memory_order_relaxed)) / 1000.0;
+    const double wait = double(g_frame_wait_us.exchange(0, std::memory_order_relaxed)) / 1000.0;
+    double part[fp::part_count];
+    for (unsigned i = 0; i < fp::part_count; ++i) part[i] = double(fp::take(fp::Part(i))) / 1000.0;
+    const double gpu_ms = double(fp::gpu_latency_max_us.exchange(0, std::memory_order_relaxed)) / 1000.0;
+    const auto gpu_done = fp::gpu_done.exchange(0, std::memory_order_relaxed);
+    if (frame_dt_ms < threshold_ms) return;
+    const double title = frame_dt_ms - ecl - present - wait;
+    std::fprintf(stderr,
+                 "[rt] slow frame %llu: %.1f ms = title %.1f + ecl %.1f/%llu (room %.1f shadows %.1f geometry %.1f "
+                 "textures %.1f: idle %.1f slot %.1f) + present %.1f + wait %.1f; gpu latency max %.1f ms over %llu\n",
+                 static_cast<unsigned long long>(state.total_frames + 1), frame_dt_ms, title, ecl,
+                 static_cast<unsigned long long>(calls), part[fp::room], part[fp::shadows], part[fp::geometry],
+                 part[fp::title_textures], part[fp::upload_idle], part[fp::upload_slot], present, wait, gpu_ms,
+                 static_cast<unsigned long long>(gpu_done));
+}
+
 void update_window_fps_title(PresentState& state, HRESULT present_hr) {
     if (FAILED(present_hr) || !state.title_hwnd) return;
     static const bool enabled = [] {
@@ -1600,6 +1636,7 @@ void update_window_fps_title(PresentState& state, HRESULT present_hr) {
         }
     }
     state.last_present = now;
+    log_slow_frame(state, frame_dt_ms);
     ++state.total_frames;
     ++state.fps_window_frames;
     state.fps_window_draws += new_draws;
@@ -1900,11 +1937,10 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
         static_cast<UINT>(plane_count),
         reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(planes),
         reinterpret_cast<const rt::d3d12::XboxPresentParameters*>(params));
-    g_fps_present_us.fetch_add(
-        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                       std::chrono::steady_clock::now() - t0)
-                                       .count()),
-        std::memory_order_relaxed);
+    const auto present_us = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+    g_fps_present_us.fetch_add(present_us, std::memory_order_relaxed);
+    g_frame_present_us.fetch_add(present_us, std::memory_order_relaxed);
     update_window_fps_title(*state, hr);
     return hr_to_u64(hr);
 }
@@ -1935,12 +1971,12 @@ std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_
     reinterpret_cast<ExecuteFn>(self->real_vtable[kQueueExecuteCommandLists])(
         self->real, static_cast<std::uint64_t>(static_cast<UINT>(count_word)),
         reinterpret_cast<ID3D12CommandList* const*>(lists_word));
-    g_fps_ecl_us.fetch_add(
-        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                       std::chrono::steady_clock::now() - t0)
-                                       .count()),
-        std::memory_order_relaxed);
+    const auto ecl_us = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+    g_fps_ecl_us.fetch_add(ecl_us, std::memory_order_relaxed);
     g_fps_ecl_calls.fetch_add(1, std::memory_order_relaxed);
+    g_frame_ecl_us.fetch_add(ecl_us, std::memory_order_relaxed);
+    g_frame_ecl_calls.fetch_add(1, std::memory_order_relaxed);
 #else
     reinterpret_cast<ExecuteFn>(self->real_vtable[kQueueExecuteCommandLists])(
         self->real, static_cast<std::uint64_t>(static_cast<UINT>(count_word)),
@@ -3100,11 +3136,10 @@ HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::ui
         const auto t0 = std::chrono::steady_clock::now();
         const HRESULT wait_hr = presentation->WaitFrameEventX(static_cast<UINT>(event), static_cast<DWORD>(timeout_ms),
                                                               static_cast<UINT>(flags), token);
-        g_fps_wait_us.fetch_add(
-            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                           std::chrono::steady_clock::now() - t0)
-                                           .count()),
-            std::memory_order_relaxed);
+        const auto wait_us = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+        g_fps_wait_us.fetch_add(wait_us, std::memory_order_relaxed);
+        g_frame_wait_us.fetch_add(wait_us, std::memory_order_relaxed);
         return wait_hr;
     }
 #endif

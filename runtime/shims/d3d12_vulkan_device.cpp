@@ -57,6 +57,7 @@
 #include "../src/vulkan_device_filter.h"
 #include "../src/vulkan13_features.h"
 #include "d3d12_compute_input_probe.h"
+#include "../src/frame_profile.h"
 #include "../src/fsdraw_probe.h"  // LOCAL DIAGNOSTIC
 #include "../src/local_diagnostics.h"
 #include "../src/mem_probe.h"  // LOCAL DIAGNOSTIC
@@ -9845,8 +9846,16 @@ public:
                 rt::compute_probe::inspect(state_, lists, sequence, queue);
             });
         state_.context->set_before_execute([this] {
-            state_.refresh_shadows();
-            state_.geometry.refresh(DeviceState::copy_geometry);
+            namespace fp = leonida::frame_profile;
+            {
+                const fp::Scope timed(fp::shadows);
+                state_.refresh_shadows();
+            }
+            {
+                const fp::Scope timed(fp::geometry);
+                state_.geometry.refresh(DeviceState::copy_geometry);
+            }
+            const fp::Scope timed(fp::title_textures);
             refresh_title_textures();
         });
         {
@@ -10161,9 +10170,15 @@ public:
             VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
             VkPhysicalDeviceProperties2 driver_properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
             get_properties(state_.info.physical, &driver_properties);
-            if (driver.driverID == VK_DRIVER_ID_MOLTENVK)
+            if (driver.driverID == VK_DRIVER_ID_MOLTENVK) {
                 layout_supported = [](const leonida::BindlessFeatures&) { return true; };
-            else if (layout_support)
+                // Fence events reach the title within 1 ms of the GPU finishing, not at the next 100 ms slice:
+                // MoltenVK's ANY wait does not reliably wake the fence dispatcher (FenceWaitDispatcher::
+                // wait_slice_ns). Measured on an M3 Pro (MoltenVK 1.4.1, Wine 11, Rosetta 2): menus went from
+                // about 14 to 22 fps on average (median 24).
+                state_.context->set_fence_wait_slice(1'000'000);
+                std::fprintf(stderr, "[rt] d3d12: fence dispatcher checks its timelines every 1 ms (MoltenVK)\n");
+            } else if (layout_support)
                 layout_supported = [&](const leonida::BindlessFeatures& candidate) {
                     const leonida::bindless::SetLayout layout(candidate);
                     VkDescriptorSetLayoutSupport support{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_SUPPORT};

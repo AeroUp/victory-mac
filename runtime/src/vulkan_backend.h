@@ -25,6 +25,7 @@
 #include "vulkan_replay.h"
 #include "queue_families.h"
 #include "resource_tiling.h"
+#include "frame_profile.h"
 #include "pipeline_profile.h"
 #include "xdxr_build.h"
 
@@ -618,6 +619,22 @@ public:
 
     // Longest single vkWaitSemaphores call in run(): bounds how long the thread can sit in an uninterruptible wait.
     static constexpr std::uint64_t kWaitSliceNs = 100'000'000;  // 100 ms
+    // The slice actually used: LEONIDA_FENCE_WAIT_SLICE_US when set, else what the device asked for
+    // (set_wait_slice), else kWaitSliceNs. On MoltenVK the ANY wait below does not reliably return when one of its
+    // timelines reaches its value (measured on an M3 Pro through Wine and Rosetta: the GPU 25-50 % busy while each
+    // submission took 100-400 ms to reach the title as a fence event, which the title waits for), so a completion
+    // was seen only at the next slice or the next enqueue. A short slice bounds that delay.
+    std::uint64_t wait_slice_ns() const {
+        static const std::uint64_t forced = [] {
+            const char* v = std::getenv("LEONIDA_FENCE_WAIT_SLICE_US");
+            const std::uint64_t us = v && *v ? std::strtoull(v, nullptr, 10) : 0;
+            return us * 1000;
+        }();
+        if (forced) return forced;
+        const std::uint64_t asked = slice_ns_.load(std::memory_order_relaxed);
+        return asked ? asked : kWaitSliceNs;
+    }
+    void set_wait_slice(std::uint64_t ns) { slice_ns_.store(ns, std::memory_order_relaxed); }
 
     FenceWaitDispatcher(VkDevice device, const VulkanDeviceFunctions& vk, std::atomic<bool>& device_lost)
         : device_(device), vk_(vk), device_lost_(device_lost) {
@@ -833,6 +850,37 @@ private:
             }
             if (stop_) return;
 
+            // LEONIDA_FENCE_PRECHECK=1: entries already reached go out at once, without a wait, in case an ANY
+            // wait that includes a timeline already at its value does not return at once (MoltenVK). Only the
+            // entries added since the last check are asked (unchecked_from_). Off by default: with the 1 ms slice
+            // it saves at most a slice, and the boots measured with it on were not faster (M3 Pro, noisy runs).
+            static const bool precheck = [] {
+                const char* v = std::getenv("LEONIDA_FENCE_PRECHECK");
+                return v && *v == '1';
+            }();
+            if (precheck && unchecked_from_ < pending_.size()) {
+                std::vector<Entry> ready;
+                std::size_t write = 0;
+                for (std::size_t i = 0; i < pending_.size(); ++i) {
+                    std::uint64_t done = 0;
+                    if (i >= unchecked_from_ &&
+                        vk_.vkGetSemaphoreCounterValue(device_, pending_[i].semaphore, &done) == VK_SUCCESS &&
+                        done >= pending_[i].value) {
+                        ready.push_back(std::move(pending_[i]));
+                    } else {
+                        if (write != i) pending_[write] = std::move(pending_[i]);
+                        ++write;
+                    }
+                }
+                pending_.resize(write);
+                unchecked_from_ = pending_.size();
+                if (!ready.empty()) {
+                    dispatch_outside_lock(lock, ready, signal_event_);
+                    if (stop_) return;
+                    continue;
+                }
+            }
+
             semaphores_.clear();
             values_.clear();
             semaphores_.push_back(wakeup_sem_);
@@ -856,7 +904,7 @@ private:
             // exiting, and TerminateProcess cannot end it either. A timeout returns here and the loop re-arms the
             // same wait; completions still wake it at once through the ANY wait.
             const VkResult res = DeviceFaultDiagnostics::observe(
-                diagnostics_, vk_.vkWaitSemaphores(device_, &wi, kWaitSliceNs), "vkWaitSemaphores (fence dispatcher)");
+                diagnostics_, vk_.vkWaitSemaphores(device_, &wi, wait_slice_ns()), "vkWaitSemaphores (fence dispatcher)");
 
             lock.lock();
             waiting_ = false;
@@ -902,6 +950,7 @@ private:
                 return;
             }
             pending_.resize(write);
+            unchecked_from_ = pending_.size();
             if (!ready.empty()) {
                 dispatch_outside_lock(lock, ready, signal_event_);
                 if (stop_) return;
@@ -916,6 +965,8 @@ private:
     SignalEventFn signal_event_ = nullptr;
     VkSemaphore wakeup_sem_ = VK_NULL_HANDLE;
     std::uint64_t wakeup_val_ = 0;
+    std::atomic<std::uint64_t> slice_ns_{0};  // set_wait_slice; 0 is kWaitSliceNs
+    std::size_t unchecked_from_ = 0;           // pending_ from here on not asked since the last check (mutex_)
 
     std::mutex mutex_;
     std::condition_variable cv_;
@@ -1466,12 +1517,12 @@ public:
         std::lock_guard queue_lock(submit_mutex_);
         LayoutPieces pieces;
         if (!tracker_.pieces(id, range, pieces) || pieces.empty()) return VK_ERROR_UNKNOWN;
+        TimelineWaits waits;
         if (image_work_pending_) {
-            const auto r = observe_result(vk.vkDeviceWaitIdle(device_), "vkDeviceWaitIdle (title staging)");
+            const auto r = title_upload_waits_locked(waits);
             if (r != VK_SUCCESS) return r;
-            image_work_pending_ = false;
         }
-        const auto r = observe_result(copy(replay_, pieces), "title staging upload");
+        const auto r = observe_result(copy(replay_, pieces, waits), "title staging upload");
         if (r == VK_SUCCESS) {
             for (const auto& p : pieces)
                 if (p.layout == VK_IMAGE_LAYOUT_UNDEFINED) tracker_.set(id, p.range, VK_IMAGE_LAYOUT_GENERAL);
@@ -1483,10 +1534,10 @@ public:
     VkResult write_staged_title_batch(bool need_device_idle, Copy&& copy) {
         std::lock_guard layout_lock(tracker_mutex_);
         std::lock_guard queue_lock(submit_mutex_);
+        TimelineWaits waits;
         if (need_device_idle && image_work_pending_) {
-            const auto r = observe_result(vk.vkDeviceWaitIdle(device_), "vkDeviceWaitIdle (title staging batch)");
+            const auto r = title_upload_waits_locked(waits);
             if (r != VK_SUCCESS) return r;
-            image_work_pending_ = false;
         }
         auto get_pieces = [&](ResourceId id, const VkImageSubresourceRange& range, LayoutPieces& pieces) {
             return tracker_.pieces(id, range, pieces) && !pieces.empty();
@@ -1495,7 +1546,44 @@ public:
             for (const auto& p : pieces)
                 if (p.layout == VK_IMAGE_LAYOUT_UNDEFINED) tracker_.set(id, p.range, VK_IMAGE_LAYOUT_GENERAL);
         };
-        return observe_result(copy(replay_, get_pieces, mark_general), "title staging batch upload");
+        return observe_result(copy(replay_, get_pieces, mark_general, waits), "title staging batch upload");
+    }
+
+    // (timeline, value) pairs a staged title-texture upload waits for on the GPU before it overwrites the image.
+    using TimelineWaits = std::vector<std::pair<VkSemaphore, std::uint64_t>>;
+
+    // What a staged title-texture upload waits for before it overwrites an image that submitted work may still read
+    // (LEONIDA_TITLE_UPLOAD_SYNC):
+    //   idle (default): vkDeviceWaitIdle on the CPU, under the submit lock, and the single-texture upload waits for
+    //     its own copy, as before.
+    //   gpu: the upload's submission waits on the GPU for every submission not yet seen complete; no CPU wait.
+    //   none: no wait. The title writes a texture's memory only once its own fences say the GPU is done reading it
+    //     (on the console the GPU reads that very memory), and those fences signal when the Vulkan work behind them
+    //     completes. Later reads on this queue follow the upload in submission order and the other queues wait for
+    //     it (TitleImageUpload).
+    // Measured on an M3 Pro (MoltenVK 1.4.1, Wine 11, Rosetta 2) through the intro and first-run menus, neither gpu
+    // nor none beat idle: the CPU wait moved into waits for staging ring slots and the game's fences.
+    enum class TitleUploadSync { idle, gpu, none };
+    static TitleUploadSync title_upload_sync() {
+        static const TitleUploadSync sync = [] {
+            const char* v = std::getenv("LEONIDA_TITLE_UPLOAD_SYNC");
+            if (v && !std::strcmp(v, "gpu")) return TitleUploadSync::gpu;
+            if (v && !std::strcmp(v, "none")) return TitleUploadSync::none;
+            return TitleUploadSync::idle;
+        }();
+        return sync;
+    }
+    VkResult title_upload_waits_locked(TimelineWaits& waits) {
+        const TitleUploadSync sync = title_upload_sync();
+        if (sync == TitleUploadSync::idle) {
+            const frame_profile::Scope timed(frame_profile::upload_idle);
+            const auto r = observe_result(vk.vkDeviceWaitIdle(device_), "vkDeviceWaitIdle (title staging)");
+            if (r == VK_SUCCESS) image_work_pending_ = false;
+            return r;
+        }
+        if (sync == TitleUploadSync::gpu)
+            waits = retire_tickets_.pending_through(submitted_ticket_.load(std::memory_order_acquire));
+        return VK_SUCCESS;
     }
 
     // Present and probe submissions have their own fences, outside the queue retirement timelines.
@@ -1815,6 +1903,10 @@ public:
     }
     void enqueue_fence_wait(VkSemaphore sem, std::uint64_t value, void* event_handle) {
         if (fence_dispatcher_) fence_dispatcher_->enqueue(sem, value, event_handle);
+    }
+    // The fence dispatcher's longest wait between checks of its timelines (FenceWaitDispatcher::wait_slice_ns).
+    void set_fence_wait_slice(std::uint64_t ns) {
+        if (fence_dispatcher_) fence_dispatcher_->set_wait_slice(ns);
     }
     void enqueue_fence_callback(VkSemaphore sem, std::uint64_t value, std::function<void()> cb) {
         if (fence_dispatcher_) fence_dispatcher_->enqueue_callback(sem, value, std::move(cb));
@@ -2629,7 +2721,12 @@ private:
     }
 
     ReplayResult execute_now(std::span<const CommandList* const> lists, std::uint64_t execute_call) {
-        if (context_.is_device_lost() || !wait_for_room()) return queue_unsupported(__LINE__);
+        bool room = false;
+        {
+            const frame_profile::Scope timed(frame_profile::room);
+            room = !context_.is_device_lost() && wait_for_room();
+        }
+        if (!room) return queue_unsupported(__LINE__);
         if (context_.before_execute_) context_.before_execute_();
         if (context_.input_probe_)
             context_.input_probe_(lists, execute_call, kind_ == QueueKind::direct ? "direct" :
@@ -3684,6 +3781,12 @@ private:
             clear_waits(ticket);
             for (auto& slot : buffers_)
                 if (slot.buffer == command_buffer) slot.ticket = ticket;
+            if (command_buffer && frame_profile::enabled())
+                context_.enqueue_fence_callback(progress_, ticket, [start = std::chrono::steady_clock::now()] {
+                    frame_profile::note_gpu_latency(std::uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                                      std::chrono::steady_clock::now() - start)
+                                                                      .count()));
+                });
         }
         return ok;
     }
