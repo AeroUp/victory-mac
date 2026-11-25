@@ -1480,10 +1480,10 @@ public:
     }
 
     template<class Copy>
-    VkResult write_staged_title_batch(Copy&& copy) {
+    VkResult write_staged_title_batch(bool need_device_idle, Copy&& copy) {
         std::lock_guard layout_lock(tracker_mutex_);
         std::lock_guard queue_lock(submit_mutex_);
-        if (image_work_pending_) {
+        if (need_device_idle && image_work_pending_) {
             const auto r = observe_result(vk.vkDeviceWaitIdle(device_), "vkDeviceWaitIdle (title staging batch)");
             if (r != VK_SUCCESS) return r;
             image_work_pending_ = false;
