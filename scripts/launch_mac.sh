@@ -86,6 +86,25 @@ fi
 
 mkdir -p "$OVERLAY_DIR" "$SAVE_DIR"
 
+# The DirectStorage BCPack predictor profile, built once from your own package (docs/directstorage.md). Without
+# it, BC7 streams that need it fail with E_DSTORAGE_DECOMPRESSION_ERROR and those textures stay missing. Takes a
+# few minutes the first time (about 3 on an M3 Pro); later launches reuse it.
+BCPACK_PROFILE="$(dirname "$SHADERS_DIR")/bcpack/history.bcph"
+if [ ! -f "$BCPACK_PROFILE" ]; then
+    PYTHON_BIN=""
+    for candidate in python3.15 python3.14 python3.13 python3; do
+        if command -v "$candidate" >/dev/null 2>&1; then PYTHON_BIN=$(command -v "$candidate"); break; fi
+    done
+    if [ -n "$PYTHON_BIN" ]; then
+        echo "Building the BCPack texture profile from your game files (first launch only)..."
+        mkdir -p "$(dirname "$BCPACK_PROFILE")"
+        "$PYTHON_BIN" -I "$REPO_DIR/tools/build_dstorage_history.py" "$GAME_DIR" --out "$BCPACK_PROFILE" --if-needed ||
+            echo "Warning: could not build $BCPACK_PROFILE; some textures may be missing." >&2
+    else
+        echo "Warning: no python3 found to build $BCPACK_PROFILE; some textures may be missing." >&2
+    fi
+fi
+
 to_win_path() {
     printf 'Z:%s' "$(printf '%s' "$1" | sed 's|/|\\|g')"
 }
