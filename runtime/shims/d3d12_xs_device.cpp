@@ -1507,6 +1507,11 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
 
 #ifdef LEONIDA_VULKAN_DEVICE
 
+std::atomic<std::uint64_t> g_fps_ecl_us{0};
+std::atomic<std::uint64_t> g_fps_ecl_calls{0};
+std::atomic<std::uint64_t> g_fps_present_us{0};
+std::atomic<std::uint64_t> g_fps_wait_us{0};
+
 struct PresentState {
     ~PresentState() {
         stop_ticker();
@@ -1524,10 +1529,15 @@ struct PresentState {
     std::wstring base_title;      // original window title preserved before appending FPS / frame pacing
     bool base_title_read = false;
     std::chrono::steady_clock::time_point fps_window_start{};
+    std::chrono::steady_clock::time_point fps_log_origin{};
+    std::chrono::steady_clock::time_point fps_log_window_start{};
     std::chrono::steady_clock::time_point last_present{};
     std::chrono::steady_clock::time_point last_title_update{};
     std::uint64_t fps_window_frames = 0;
     std::uint64_t fps_window_draws = 0;
+    std::uint64_t fps_log_frames = 0;
+    std::uint64_t fps_log_draws = 0;
+    std::vector<double> fps_log_dts;
     std::uint64_t total_frames = 0;
     double last_fps = 0.0;
     double last_ms = 0.0;
@@ -1575,16 +1585,26 @@ void update_window_fps_title(PresentState& state, HRESULT present_hr) {
     std::lock_guard lock(state.title_mutex);
     if (state.fps_window_start == std::chrono::steady_clock::time_point{}) {
         state.fps_window_start = now;
+        state.fps_log_origin = now;
+        state.fps_log_window_start = now;
+        state.fps_log_dts.reserve(256);
     }
+    double frame_dt_ms = 0.0;
     if (state.last_present != std::chrono::steady_clock::time_point{}) {
         const auto dt_us =
             std::chrono::duration_cast<std::chrono::microseconds>(now - state.last_present).count();
-        if (dt_us > 0) state.last_ms = double(dt_us) / 1000.0;
+        if (dt_us > 0) {
+            frame_dt_ms = double(dt_us) / 1000.0;
+            state.last_ms = frame_dt_ms;
+            state.fps_log_dts.push_back(frame_dt_ms);
+        }
     }
     state.last_present = now;
     ++state.total_frames;
     ++state.fps_window_frames;
     state.fps_window_draws += new_draws;
+    ++state.fps_log_frames;
+    state.fps_log_draws += new_draws;
     if (new_draws > 0 || state.total_frames == 1)
         state.last_draws_per_frame = state.fps_window_frames > 0
                                          ? (state.fps_window_draws / state.fps_window_frames)
@@ -1601,6 +1621,47 @@ void update_window_fps_title(PresentState& state, HRESULT present_hr) {
         state.fps_window_start = now;
         state.fps_window_frames = 0;
         state.fps_window_draws = 0;
+    }
+
+    static const bool fps_log_enabled = [] {
+        const char* v = std::getenv("LEONIDA_FPS_LOG");
+        return !(v && *v == '0');
+    }();
+    if (fps_log_enabled) {
+        const auto log_elapsed_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(now - state.fps_log_window_start).count();
+        if (log_elapsed_us >= 1000000 && state.fps_log_frames > 0) {
+            const double sec =
+                std::chrono::duration<double>(now - state.fps_log_origin).count();
+            const double fps = double(state.fps_log_frames) * 1e6 / double(log_elapsed_us);
+            const double avg_ms = double(log_elapsed_us) / (1000.0 * double(state.fps_log_frames));
+            double min_ms = avg_ms, p50_ms = avg_ms, p95_ms = avg_ms, max_ms = avg_ms;
+            if (!state.fps_log_dts.empty()) {
+                std::sort(state.fps_log_dts.begin(), state.fps_log_dts.end());
+                const std::size_t n = state.fps_log_dts.size();
+                min_ms = state.fps_log_dts.front();
+                p50_ms = state.fps_log_dts[n / 2];
+                p95_ms = state.fps_log_dts[(n * 95) / 100 >= n ? n - 1 : (n * 95) / 100];
+                max_ms = state.fps_log_dts.back();
+            }
+            const std::uint64_t avg_draws = state.fps_log_draws / state.fps_log_frames;
+            const double ecl_ms = double(g_fps_ecl_us.exchange(0, std::memory_order_relaxed)) /
+                                  (1000.0 * double(state.fps_log_frames));
+            const std::uint64_t ecl_calls = g_fps_ecl_calls.exchange(0, std::memory_order_relaxed);
+            const double pres_ms = double(g_fps_present_us.exchange(0, std::memory_order_relaxed)) /
+                                   (1000.0 * double(state.fps_log_frames));
+            const double wait_ms = double(g_fps_wait_us.exchange(0, std::memory_order_relaxed)) /
+                                   (1000.0 * double(state.fps_log_frames));
+            std::fprintf(stderr,
+                         "[rt] fps: t=%.1fs frame=%llu fps=%.1f avg=%.1fms (ecl=%.1fms/%llu pres=%.1fms wait=%.1fms) min=%.1fms p50=%.1fms p95=%.1fms max=%.1fms draws=%llu\n",
+                         sec, static_cast<unsigned long long>(state.total_frames), fps, avg_ms, ecl_ms,
+                         static_cast<unsigned long long>(ecl_calls / state.fps_log_frames), pres_ms, wait_ms,
+                         min_ms, p50_ms, p95_ms, max_ms, static_cast<unsigned long long>(avg_draws));
+            state.fps_log_window_start = now;
+            state.fps_log_frames = 0;
+            state.fps_log_draws = 0;
+            state.fps_log_dts.clear();
+        }
     }
 
     if (!state.ticker.joinable()) {
@@ -1834,10 +1895,16 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
                               std::uint64_t params) {
     PresentState* state = self->device ? present_state_for(self->device) : nullptr;
     if (!state || !state->xbox) return hr_to_u64(S_OK);  // a title still runs with nothing presented
+    const auto t0 = std::chrono::steady_clock::now();
     const HRESULT hr = state->xbox->PresentX(
         static_cast<UINT>(plane_count),
         reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(planes),
         reinterpret_cast<const rt::d3d12::XboxPresentParameters*>(params));
+    g_fps_present_us.fetch_add(
+        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                       std::chrono::steady_clock::now() - t0)
+                                       .count()),
+        std::memory_order_relaxed);
     update_window_fps_title(*state, hr);
     return hr_to_u64(hr);
 }
@@ -1863,9 +1930,22 @@ std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_
     if (unwrapped_lists.data()) lists_word = unwrapped_lists.data();
     // Pass zero-extended UINT in 64-bit RDX so both 32-bit PC implementations and 64-bit mock thunks see clean count.
     using ExecuteFn = void(WINAPI*)(void*, std::uint64_t, ID3D12CommandList* const*);
+#ifdef LEONIDA_VULKAN_DEVICE
+    const auto t0 = std::chrono::steady_clock::now();
     reinterpret_cast<ExecuteFn>(self->real_vtable[kQueueExecuteCommandLists])(
         self->real, static_cast<std::uint64_t>(static_cast<UINT>(count_word)),
         reinterpret_cast<ID3D12CommandList* const*>(lists_word));
+    g_fps_ecl_us.fetch_add(
+        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                       std::chrono::steady_clock::now() - t0)
+                                       .count()),
+        std::memory_order_relaxed);
+    g_fps_ecl_calls.fetch_add(1, std::memory_order_relaxed);
+#else
+    reinterpret_cast<ExecuteFn>(self->real_vtable[kQueueExecuteCommandLists])(
+        self->real, static_cast<std::uint64_t>(static_cast<UINT>(count_word)),
+        reinterpret_cast<ID3D12CommandList* const*>(lists_word));
+#endif
     return 0;
 }
 
@@ -3016,9 +3096,17 @@ HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::ui
         return hr;
     if (!token) return E_POINTER;
 #ifdef LEONIDA_VULKAN_DEVICE
-    if (auto* presentation = device_presentation(self))
-        return presentation->WaitFrameEventX(static_cast<UINT>(event), static_cast<DWORD>(timeout_ms),
-                                             static_cast<UINT>(flags), token);
+    if (auto* presentation = device_presentation(self)) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const HRESULT wait_hr = presentation->WaitFrameEventX(static_cast<UINT>(event), static_cast<DWORD>(timeout_ms),
+                                                              static_cast<UINT>(flags), token);
+        g_fps_wait_us.fetch_add(
+            static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                           std::chrono::steady_clock::now() - t0)
+                                           .count()),
+            std::memory_order_relaxed);
+        return wait_hr;
+    }
 #endif
     *token = self->frame_tokens->issue();
     return S_OK;

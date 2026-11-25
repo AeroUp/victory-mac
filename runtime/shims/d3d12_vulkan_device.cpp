@@ -15903,13 +15903,21 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     if (create_surface(info.instance, &surface_info, nullptr, &surface) != VK_SUCCESS) return nullptr;
     // LEONIDA_PRESENT_NO_TEAR=1 keeps the swapchain FIFO-only (ImmediateThresholdPercent then does nothing).
-    // Any non-empty value other than "0" turns it off.
-    bool tear_allowed = true;
+    // Default to no-tear on MoltenVK (macOS CAMetalLayer only offers FIFO and IMMEDIATE); explicit "0" re-enables tearing.
+    bool is_moltenvk = false;
+    if (const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+            info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2"))) {
+        VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+        get_props2(info.physical, &props);
+        is_moltenvk = driver.driverID == VK_DRIVER_ID_MOLTENVK;
+    }
+    bool tear_allowed = !is_moltenvk;
     {
         char* value = nullptr;
         std::size_t length = 0;
         if (_dupenv_s(&value, &length, "LEONIDA_PRESENT_NO_TEAR") == 0 && value) {
-            tear_allowed = value[0] == '\0' || std::strcmp(value, "0") == 0;
+            if (value[0] != '\0') tear_allowed = std::strcmp(value, "0") == 0;
             std::free(value);
         }
     }
@@ -15939,7 +15947,8 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
                                                                                        &made) != VK_SUCCESS)
                                                                         return VK_NULL_HANDLE;
                                                                     return made;
-                                                                });
+                                                                },
+                                                                tear_allowed);
     if (!presenter->ok()) {
         std::fprintf(stderr, "[rt] d3d12: cannot present to this window from the device's queue family\n");
         return nullptr;

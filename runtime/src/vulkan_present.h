@@ -119,9 +119,10 @@ public:
                     VkPhysicalDevice physical, VkQueue queue, std::uint32_t family, VkSurfaceKHR surface,
                     bool swapchain_maintenance1 = false,
                     std::function<VkExtent2D()> extent_fn = nullptr,
-                    std::function<VkSurfaceKHR()> recreate_surface_fn = nullptr)
+                    std::function<VkSurfaceKHR()> recreate_surface_fn = nullptr,
+                    bool allow_immediate = true)
         : context_(context), instance_(instance), physical_(physical), queue_(queue), surface_(surface),
-          maintenance1_(swapchain_maintenance1), extent_fn_(std::move(extent_fn)),
+          maintenance1_(swapchain_maintenance1), allow_immediate_(allow_immediate), extent_fn_(std::move(extent_fn)),
           recreate_surface_fn_(std::move(recreate_surface_fn)) {
 #define LEONIDA_INSTANCE_FN(name) name##_ = reinterpret_cast<PFN_##name>(get_instance(instance, #name));
         LEONIDA_INSTANCE_FN(vkGetPhysicalDeviceSurfaceSupportKHR)
@@ -1617,11 +1618,13 @@ private:
         modes.resize(count);
         VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;  // always available
         if (!vsync) {
-            for (const VkPresentModeKHR wanted : {VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR})
+            for (const VkPresentModeKHR wanted : {VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR}) {
+                if (wanted == VK_PRESENT_MODE_IMMEDIATE_KHR && !allow_immediate_) continue;
                 if (std::find(modes.begin(), modes.end(), wanted) != modes.end()) {
                     mode = wanted;
                     break;
                 }
+            }
         }
 
         VkSwapchainCreateInfoKHR info{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
@@ -1706,6 +1709,18 @@ private:
         swapchain_srgb_ = srgb;
         swapchain_hdr_req_ = hdr;
         stale_ = false;
+        const auto mode_name = [](VkPresentModeKHR m) -> const char* {
+            switch (m) {
+            case VK_PRESENT_MODE_IMMEDIATE_KHR: return "IMMEDIATE";
+            case VK_PRESENT_MODE_MAILBOX_KHR: return "MAILBOX";
+            case VK_PRESENT_MODE_FIFO_KHR: return "FIFO";
+            case VK_PRESENT_MODE_FIFO_RELAXED_KHR: return "FIFO_RELAXED";
+            default: return "none";
+            }
+        };
+        std::fprintf(stderr, "[rt] present: swapchain %ux%u mode=%s vsync=%d tear_mode=%s allow_immediate=%d images=%zu\n",
+                     extent.width, extent.height, mode_name(mode), int(vsync), mode_name(tear_mode_),
+                     int(allow_immediate_), images_.size());
         return true;
     }
 
@@ -1781,6 +1796,7 @@ private:
     std::deque<PendingPresent> deferred_;  // presents queued behind held work, in call order
     VkSurfaceKHR surface_;
     bool maintenance1_ = false;  // VK_KHR/EXT_swapchain_maintenance1 (and the surface extension) are enabled
+    bool allow_immediate_ = true;  // false when LEONIDA_PRESENT_NO_TEAR=1 (or MoltenVK default) keeps FIFO even if !vsync
     VkPresentModeKHR tear_mode_ = VK_PRESENT_MODE_MAX_ENUM_KHR;  // set with the swapchain, see tear_mode()
     std::atomic<bool> last_tore_{false};
     std::atomic<std::uint64_t> extent_packed_{0};  // extent_ for readers that must not wait for a present
